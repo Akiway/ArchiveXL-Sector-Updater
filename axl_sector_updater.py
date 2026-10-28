@@ -273,6 +273,8 @@ ELEMENT_KEYS = [('actorDeletions', 'expectedActors'), ('elementDeletions', 'expe
 
 def load_xl(path):
     text = open(path, encoding='utf-8-sig').read()
+    # Hand-edited files can carry trailing tabs, which ArchiveXL tolerates but PyYAML rejects.
+    text = '\n'.join(line.rstrip() for line in text.splitlines())
     return yaml.safe_load(text), text.lstrip().startswith('{')
 
 
