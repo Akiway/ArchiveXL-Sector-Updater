@@ -301,8 +301,8 @@ ELEMENT_KEYS = [('actorDeletions', 'expectedActors'), ('elementDeletions', 'expe
 def load_xl(path):
     text = open(path, encoding='utf-8-sig').read()
     # Hand-edited files can carry trailing tabs, which ArchiveXL tolerates but PyYAML rejects.
-    text = '\n'.join(line.rstrip() for line in text.splitlines())
-    return yaml.safe_load(text), text.lstrip().startswith('{')
+    text = '\n'.join(line.rstrip() for line in text.splitlines()) + '\n'
+    return yaml.safe_load(text), text.lstrip().startswith('{'), text
 
 
 class IndentDumper(yaml.SafeDumper):
@@ -330,15 +330,12 @@ def save_xl(path, data, as_json):
 
 
 def update(xl, source, target, radius, report, label=''):
-    out_sectors = {}
+    """Match every node of the file. Returns {(sector no, kind, node no): (new sector path, updated node)} for the
+    nodes found, (None, why) for the others, in the order they were assigned."""
+    outcome = {}
     in_sectors = xl['streaming']['sectors']
     show_progress = sys.stderr.isatty()  # no progress lines in redirected output
-
-    def out_sector(path):
-        if path not in out_sectors:
-            out_sectors[path] = {'nodeDeletions': [], 'nodeMutations': [],
-                                 'expectedNodes': len(target.sector(path)), 'path': path}
-        return out_sectors[path]
+    not_found = f'not found in {target.version}'
 
     for done, sector in enumerate(in_sectors):
         if show_progress:
@@ -347,8 +344,9 @@ def update(xl, source, target, radius, report, label=''):
         old_records = source.sector(path)
         if old_records is None:
             for kind in ('nodeDeletions', 'nodeMutations'):
-                for node in sector.get(kind) or []:
+                for n, node in enumerate(sector.get(kind) or []):
                     report.append(row(path, kind, node, None, 'not found', note='sector missing from the source export'))
+                    outcome[done, kind, n] = None, f'sector missing from the {source.version} export'
             continue
         if sector.get('expectedNodes') not in (None, len(old_records)):
             print(f'\rwarning: {path} has {len(old_records)} nodes in the source version, the file expects '
@@ -360,16 +358,18 @@ def update(xl, source, target, radius, report, label=''):
         # Best candidate of every node first, then assign greedily so two removals never take the same node.
         wanted = []
         for kind in ('nodeDeletions', 'nodeMutations'):
-            for node in sector.get(kind) or []:
+            for n, node in enumerate(sector.get(kind) or []):
                 idx = node['index']
                 if idx >= len(old_records):
                     report.append(row(path, kind, node, None, 'not found', note='index out of range in the source version'))
+                    outcome[done, kind, n] = None, f'index out of range in {source.version}'
                     continue
                 old = old_records[idx]
                 mismatch = source_mismatch(node, old)
                 if mismatch:
                     # The file was not made for the source version (or the node changed): remapping would hit the wrong node.
                     report.append(row(path, kind, node, old, 'source mismatch', note=mismatch))
+                    outcome[done, kind, n] = None, f'does not match {source.version}: {mismatch}'
                     continue
                 note = ''
                 found = candidates(old, [(path, here)] if here else [], radius)
@@ -377,13 +377,14 @@ def update(xl, source, target, radius, report, label=''):
                     if around is None:
                         around = [(p, r) for p in neighbours(path) if (r := target.sector(p)) is not None]
                     found = sorted(found + candidates(old, around, radius), key=lambda c: c[1])
-                wanted.append((kind, node, old, found, note))
+                wanted.append((kind, n, node, old, found, note))
 
         taken = set()
-        for kind, node, old, found, note in sorted(wanted, key=lambda w: w[3][0][1] if w[3] else (99,)):
+        for kind, n, node, old, found, note in sorted(wanted, key=lambda w: w[4][0][1] if w[4] else (99,)):
             choice = next((c for c in found if (c[2], c[3].index) not in taken), None)
             if choice is None:
                 report.append(row(path, kind, node, old, 'not found', note=note))
+                outcome[done, kind, n] = None, not_found
                 continue
             level, _, new_path, new, details = choice
             taken.add((new_path, new.index))
@@ -406,11 +407,24 @@ def update(xl, source, target, radius, report, label=''):
                         note = (note + '; ' if note else '') + f'{list_key} not found: {missing}'
                         if level == 'exact':
                             level = 'match'
-            out_sector(new_path)[kind].append(updated)
+            outcome[done, kind, n] = new_path, updated
             report.append(row(path, kind, node, old, level, new_path, new, details, actors, note))
 
     if show_progress:
         print(f'\r{label}: {len(in_sectors)} / {len(in_sectors)} sectors (100%)', file=sys.stderr)
+    return outcome
+
+
+def rebuild(xl, outcome, target):
+    """The converted file as data: one entry per sector, sorted by path, nodes sorted by index."""
+    out_sectors = {}
+    for (_, kind, _), (new_path, updated) in outcome.items():
+        if new_path is None:
+            continue
+        if new_path not in out_sectors:
+            out_sectors[new_path] = {'nodeDeletions': [], 'nodeMutations': [],
+                                     'expectedNodes': len(target.sector(new_path)), 'path': new_path}
+        out_sectors[new_path][kind].append(updated)
 
     sectors = []
     for s in out_sectors.values():
@@ -424,6 +438,135 @@ def update(xl, source, target, radius, report, label=''):
     result['streaming'] = dict(xl['streaming'])
     result['streaming']['sectors'] = sorted(sectors, key=lambda s: s['path'])
     return result
+
+
+def flow(value):
+    return '[' + ', '.join(map(str, value)) + ']' if isinstance(value, list) else str(value)
+
+
+def patch_yaml(text, xl, outcome, target):
+    """The converted file as YAML, written into the input text so that its comments, order and layout stay.
+    A node without a match is commented out where it was, with the reason; a node found in another sector is
+    commented out too and added to that sector."""
+    root = yaml.compose(text)
+    edits = []  # (start, end, replacement) in the text
+    kinds = ('nodeDeletions', 'nodeMutations')
+    count_list = {count_key: list_key for list_key, count_key in ELEMENT_KEYS}
+
+    def fields(mapping):
+        return {k.value: (k, v) for k, v in mapping.value}
+
+    def end_of(node):
+        # A block collection ends at the next token, past the comments after it: take its last leaf instead.
+        while isinstance(node, yaml.CollectionNode) and not node.flow_style and node.value:
+            node = node.value[-1][1] if isinstance(node, yaml.MappingNode) else node.value[-1]
+        return node.end_mark.index
+
+    def line_start(i):
+        return text.rfind('\n', 0, i) + 1
+
+    def line_end(i):
+        return text.find('\n', i)
+
+    def dash(item):
+        return text.rfind('-', 0, item.start_mark.index)  # the "- " that opens a sequence item
+
+    def comment_out(start, end, note=None):
+        a, b = line_start(start), line_end(end - 1)
+        col = start - a
+        lines = []
+        for line in text[a:b].split('\n'):
+            indent = min(col, len(line) - len(line.lstrip()))
+            lines.append(line if not line.strip() or line.lstrip().startswith('#') else f'{line[:indent]}# {line[indent:]}')
+        if note:
+            lines.insert(0, f'{" " * col}# axl_sector_updater: {note}')
+        edits.append((a, b, '\n'.join(lines)))
+
+    def set_value(mapping, key, value, after):
+        """Give key this value, on a new line after the <after> key when it is missing."""
+        found = fields(mapping)
+        if key in found:
+            k, v = found[key]
+            edits.append((k.end_mark.index, end_of(v), f': {flow(value)}'))
+        else:
+            k, v = found.get(after) or mapping.value[0]
+            at = line_end(end_of(v) - 1)
+            edits.append((at, at, f'\n{" " * k.start_mark.column}{key}: {flow(value)}'))
+
+    def block(data, col):
+        dumped = yaml.dump(data, Dumper=IndentDumper, sort_keys=False, allow_unicode=True, default_flow_style=False)
+        return ''.join(f'\n{" " * col}{line}' for line in dumped.splitlines())
+
+    in_sectors = xl['streaming']['sectors']
+    entries = fields(fields(root)['streaming'][1])['sectors'][1]
+    kept = {si for (si, _, _), (new_path, _) in outcome.items() if new_path == in_sectors[si]['path']}
+    home = {}  # sector path -> first entry keeping nodes there, which receives the nodes that moved to that sector
+    for si in sorted(kept):
+        home.setdefault(in_sectors[si]['path'], si)
+    arriving = defaultdict(lambda: defaultdict(list))  # sector path -> kind -> nodes that moved there
+    dead_lists = set()
+
+    for si, (sector, entry) in enumerate(zip(in_sectors, entries.value)):
+        path = sector['path']
+        if si in kept:
+            expected = len(target.sector(path))
+            if sector.get('expectedNodes') != expected:
+                set_value(entry, 'expectedNodes', expected, 'path')
+        for i, (k, v) in enumerate(entry.value):
+            start = dash(entry) if i == 0 else k.start_mark.index
+            if k.value not in kinds or not isinstance(v, yaml.SequenceNode):
+                if si not in kept:  # nothing left in this entry
+                    comment_out(start, end_of(v))
+                continue
+            nodes = sector.get(k.value) or []
+            gone = 0
+            for n, (node, item) in enumerate(zip(nodes, v.value)):
+                new_path, updated = outcome[si, k.value, n]
+                if new_path == path:
+                    for key, value in updated.items():
+                        if key not in node or node[key] != value:
+                            set_value(item, key, value, count_list.get(key, 'index'))
+                    continue
+                gone += 1
+                if new_path is None:
+                    note = updated
+                else:
+                    name = new_path.rsplit('\\', 1)[-1]
+                    note = f'moved to {name} in {target.version}'
+                    arriving[new_path][k.value].append(updated)
+                comment_out(dash(item), end_of(item), note)
+            if si not in kept or (nodes and gone == len(nodes)):
+                comment_out(start, k.end_mark.index)  # the key line; its nodes are commented out above
+                dead_lists.add((si, k.value))
+
+    for path, moved in arriving.items():
+        for nodes in moved.values():
+            nodes.sort(key=lambda n: n['index'])
+        if path not in home:  # new sector entry at the end of the list
+            col = dash(entries.value[0]) - line_start(entries.value[0].start_mark.index)
+            data = [{'path': path, 'expectedNodes': len(target.sector(path)), **moved}]
+            at = line_end(end_of(entries) - 1)
+            edits.append((at, at, block(data, col)))
+            continue
+        entry = entries.value[home[path]]
+        for kind, nodes in moved.items():
+            existing = fields(entry).get(kind)
+            if existing and isinstance(existing[1], yaml.SequenceNode) and existing[1].value \
+                    and (home[path], kind) not in dead_lists:
+                first = existing[1].value[0]
+                at = line_end(end_of(existing[1]) - 1)
+                edits.append((at, at, block(nodes, dash(first) - line_start(first.start_mark.index))))
+            else:
+                at = line_end(end_of(entry) - 1)
+                edits.append((at, at, block({kind: nodes}, entry.value[0][0].start_mark.column)))
+
+    out, pos = [], 0
+    for start, end, new in sorted(edits, key=lambda e: e[0]):  # stable: insertions at one place keep their order
+        assert start >= pos, 'overlapping edits'
+        out += [text[pos:start], new]
+        pos = end
+    out.append(text[pos:])
+    return ''.join(out)
 
 
 def row(path, kind, node, old, status, new_path=None, new=None, details=None, actors='', note=''):
@@ -470,18 +613,22 @@ def jobs(input_path, output_path):
 
 def convert(input_path, output_path, source, target, radius, debug, output_format=None):
     """Convert one file. Returns the report rows, or None when the file has no streaming sectors.
-    output_format: 'json' or 'yaml'; None keeps the format of the input."""
-    xl, as_json = load_xl(input_path)
-    if output_format:
-        as_json = output_format == 'json'
+    output_format: 'json' or 'yaml'; None keeps the format of the input.
+    YAML to YAML edits the input text, which keeps its comments and order; otherwise the file is rewritten."""
+    xl, in_json, text = load_xl(input_path)
+    as_json = output_format == 'json' if output_format else in_json
     if not isinstance(xl, dict) or not isinstance(xl.get('streaming'), dict) or not xl['streaming'].get('sectors'):
         return None
     if os.path.abspath(input_path) == os.path.abspath(output_path):
         raise SystemExit(f'{input_path}: the output would overwrite the input')
     report = []
-    result = update(xl, source, target, radius, report, os.path.basename(input_path))
+    outcome = update(xl, source, target, radius, report, os.path.basename(input_path))
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    save_xl(output_path, result, as_json)
+    if in_json or as_json:
+        save_xl(output_path, rebuild(xl, outcome, target), as_json)
+    else:
+        with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(patch_yaml(text, xl, outcome, target))
     if debug:
         with open(output_path + '.report.tsv', 'w', encoding='utf-8', newline='') as f:
             w = csv.DictWriter(f, fieldnames=list(report[0].keys()) if report else ['status'], delimiter='\t')
