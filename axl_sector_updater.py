@@ -348,6 +348,21 @@ def update(xl, source, target, radius, report, label=''):
     show_progress = sys.stderr.isatty()  # no progress lines in redirected output
     not_found = f'not found in {target.version}'
 
+    def was(old, node):
+        """What the node was in the source version, to look for it by hand."""
+        def at(p):
+            return f'at [{", ".join(map(str, p[:3]))}]'
+
+        if old.debug_name:
+            what = f"'{old.debug_name}'"
+        else:  # no name: its resource, if any
+            what = next((v for v in (old.raw.get('r') or {}).values() if '\\' in v), '')
+        # Instanced nodes often sit at the origin: give the positions of the actors / instances the file lists.
+        where = [f'{list_key[:-9]} {element_index(e)} {at(old.elements[element_index(e)])}'
+                 for list_key, _ in ELEMENT_KEYS for e in node.get(list_key) or []
+                 if old.elements and 0 <= element_index(e) < len(old.elements)][:3]
+        return ' '.join(filter(None, [f'was in {source.version}: {old.type}', what, ', '.join(where) or at(old.position)]))
+
     for done, sector in enumerate(in_sectors):
         if show_progress:
             print(f'\r{label}: {done} / {len(in_sectors)} sectors ({done * 100 // len(in_sectors)}%)', end='', file=sys.stderr)
@@ -395,7 +410,7 @@ def update(xl, source, target, radius, report, label=''):
             choice = next((c for c in found if (c[2], c[3].index) not in taken), None)
             if choice is None:
                 report.append(row(path, kind, node, old, 'not found', note=note))
-                outcome[done, kind, n] = None, not_found, None
+                outcome[done, kind, n] = None, f'{not_found}\n{was(old, node)}', None
                 continue
             level, _, new_path, new, details = choice
             taken.add((new_path, new.index))
@@ -435,7 +450,7 @@ def update(xl, source, target, radius, report, label=''):
                 # Without any of its actors / instances, a deletion would remove the whole node.
                 taken.discard((new_path, new.index))
                 report.append(row(path, kind, node, old, 'not found', new_path, new, details, actors, note))
-                outcome[done, kind, n] = None, f'none of its {lost[:-9]}s found in {target.version}', None
+                outcome[done, kind, n] = None, f'none of its {lost[:-9]}s found in {target.version}\n{was(old, node)}', None
                 continue
             outcome[done, kind, n] = new_path, updated, remaps
             report.append(row(path, kind, node, old, level, new_path, new, details, actors, note))
@@ -508,7 +523,7 @@ def patch_yaml(text, xl, outcome, target):
             indent = min(col, len(line) - len(line.lstrip()))
             lines.append(line if not line.strip() or line.lstrip().startswith('#') else f'{line[:indent]}# {line[indent:]}')
         if note:
-            lines.insert(0, f'{" " * col}# axl_sector_updater: {note}')
+            lines[:0] = [f'{" " * col}# axl_sector_updater: {line}' for line in note.split('\n')]
         edits.append((a, b, '\n'.join(lines)))
 
     def set_value(mapping, key, value, after):
