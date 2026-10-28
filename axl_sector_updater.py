@@ -329,8 +329,10 @@ def save_xl(path, data, as_json):
             yaml.dump(data, f, Dumper=IndentDumper, sort_keys=False, allow_unicode=True, default_flow_style=False)
 
 
-def update(xl, source, target, radius, report):
+def update(xl, source, target, radius, report, label=''):
     out_sectors = {}
+    in_sectors = xl['streaming']['sectors']
+    show_progress = sys.stderr.isatty()  # no progress lines in redirected output
 
     def out_sector(path):
         if path not in out_sectors:
@@ -338,7 +340,9 @@ def update(xl, source, target, radius, report):
                                  'expectedNodes': len(target.sector(path)), 'path': path}
         return out_sectors[path]
 
-    for sector in xl['streaming']['sectors']:
+    for done, sector in enumerate(in_sectors):
+        if show_progress:
+            print(f'\r{label}: {done} / {len(in_sectors)} sectors ({done * 100 // len(in_sectors)}%)', end='', file=sys.stderr)
         path = sector['path']
         old_records = source.sector(path)
         if old_records is None:
@@ -347,7 +351,7 @@ def update(xl, source, target, radius, report):
                     report.append(row(path, kind, node, None, 'not found', note='sector missing from the source export'))
             continue
         if sector.get('expectedNodes') not in (None, len(old_records)):
-            print(f'warning: {path} has {len(old_records)} nodes in the source version, the file expects '
+            print(f'\rwarning: {path} has {len(old_records)} nodes in the source version, the file expects '
                   f'{sector["expectedNodes"]}: it was not made for this source version', file=sys.stderr)
 
         here = target.sector(path)
@@ -404,6 +408,9 @@ def update(xl, source, target, radius, report):
                             level = 'match'
             out_sector(new_path)[kind].append(updated)
             report.append(row(path, kind, node, old, level, new_path, new, details, actors, note))
+
+    if show_progress:
+        print(f'\r{label}: {len(in_sectors)} / {len(in_sectors)} sectors (100%)', file=sys.stderr)
 
     sectors = []
     for s in out_sectors.values():
@@ -472,7 +479,7 @@ def convert(input_path, output_path, source, target, radius, debug, output_forma
     if os.path.abspath(input_path) == os.path.abspath(output_path):
         raise SystemExit(f'{input_path}: the output would overwrite the input')
     report = []
-    result = update(xl, source, target, radius, report)
+    result = update(xl, source, target, radius, report, os.path.basename(input_path))
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     save_xl(output_path, result, as_json)
     if debug:
