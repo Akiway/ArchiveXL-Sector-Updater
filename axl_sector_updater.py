@@ -321,12 +321,8 @@ def _represent_list(dumper, data):
 IndentDumper.add_representer(list, _represent_list)
 
 
-def save_xl(path, data, as_json):
-    with open(path, 'w', encoding='utf-8', newline='\n') as f:
-        if as_json:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        else:
-            yaml.dump(data, f, Dumper=IndentDumper, sort_keys=False, allow_unicode=True, default_flow_style=False)
+def to_yaml(data):
+    return yaml.dump(data, Dumper=IndentDumper, sort_keys=False, allow_unicode=True, default_flow_style=False)
 
 
 def update(xl, source, target, radius, report, label=''):
@@ -494,8 +490,7 @@ def patch_yaml(text, xl, outcome, target):
             edits.append((at, at, f'\n{" " * k.start_mark.column}{key}: {flow(value)}'))
 
     def block(data, col):
-        dumped = yaml.dump(data, Dumper=IndentDumper, sort_keys=False, allow_unicode=True, default_flow_style=False)
-        return ''.join(f'\n{" " * col}{line}' for line in dumped.splitlines())
+        return ''.join(f'\n{" " * col}{line}' for line in to_yaml(data).splitlines())
 
     in_sectors = xl['streaming']['sectors']
     entries = fields(fields(root)['streaming'][1])['sectors'][1]
@@ -592,8 +587,14 @@ def is_xl(path):
     return path.lower().endswith(XL_EXTENSIONS)
 
 
-def jobs(input_path, output_path):
-    """(input file, output file) pairs. A folder input is walked recursively and mirrored into the output folder."""
+def jobs(input_path, output_path, yaml_out):
+    """(input file, output file) pairs. A folder input is walked recursively and mirrored into the output folder.
+    With yaml_out, an output named after a .json input becomes .xl."""
+
+    def output_name(name):
+        root, ext = os.path.splitext(name)
+        return root + '.xl' if yaml_out and ext.lower() == '.json' else name
+
     if os.path.isdir(input_path):
         if is_xl(output_path) and not os.path.isdir(output_path):
             raise SystemExit(f'{input_path} is a folder: the output must be a folder too')
@@ -602,21 +603,26 @@ def jobs(input_path, output_path):
             for name in files:
                 if is_xl(name):
                     path = os.path.join(folder, name)
-                    found.append((path, os.path.join(output_path, os.path.relpath(path, input_path))))
+                    found.append((path, os.path.join(output_path, output_name(os.path.relpath(path, input_path)))))
+        outputs = defaultdict(list)
+        for path, out in found:
+            outputs[os.path.normcase(out)].append(path)
+        for paths in outputs.values():
+            if len(paths) > 1:
+                raise SystemExit(f'{" and ".join(sorted(paths))} would both be written to the same output file')
         return sorted(found)
     if not os.path.isfile(input_path):
         raise SystemExit(f'{input_path} does not exist')
     if os.path.isdir(output_path) or not is_xl(output_path):
-        output_path = os.path.join(output_path, os.path.basename(input_path))
+        output_path = os.path.join(output_path, output_name(os.path.basename(input_path)))
     return [(input_path, output_path)]
 
 
-def convert(input_path, output_path, source, target, radius, debug, output_format=None):
+def convert(input_path, output_path, source, target, radius, debug, output_format='yaml'):
     """Convert one file. Returns the report rows, or None when the file has no streaming sectors.
-    output_format: 'json' or 'yaml'; None keeps the format of the input.
-    YAML to YAML edits the input text, which keeps its comments and order; otherwise the file is rewritten."""
+    output_format 'yaml' edits the input text, which keeps its comments and order (a JSON input is first written as
+    YAML); 'json' rewrites the file."""
     xl, in_json, text = load_xl(input_path)
-    as_json = output_format == 'json' if output_format else in_json
     if not isinstance(xl, dict) or not isinstance(xl.get('streaming'), dict) or not xl['streaming'].get('sectors'):
         return None
     if os.path.abspath(input_path) == os.path.abspath(output_path):
@@ -624,11 +630,11 @@ def convert(input_path, output_path, source, target, radius, debug, output_forma
     report = []
     outcome = update(xl, source, target, radius, report, os.path.basename(input_path))
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    if in_json or as_json:
-        save_xl(output_path, rebuild(xl, outcome, target), as_json)
-    else:
-        with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
-            f.write(patch_yaml(text, xl, outcome, target))
+    with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
+        if output_format == 'json':
+            json.dump(rebuild(xl, outcome, target), f, indent=2, ensure_ascii=False)
+        else:
+            f.write(patch_yaml(to_yaml(xl) if in_json else text, xl, outcome, target))
     if debug:
         with open(output_path + '.report.tsv', 'w', encoding='utf-8', newline='') as f:
             w = csv.DictWriter(f, fieldnames=list(report[0].keys()) if report else ['status'], delimiter='\t')
@@ -648,14 +654,15 @@ def main():
     ap.add_argument('--release-url', default=RELEASE_URL, help='where missing node exports are downloaded from')
     ap.add_argument('--radius', type=float, default=2.0,
                     help='max distance (m) to accept a node that moved, when its resources still match (default 2)')
-    ap.add_argument('--format', type=str.lower, choices=['yaml', 'yml', 'json'],
-                    help='write the output content as YAML (yaml or yml) or JSON (default: same as the input)')
+    ap.add_argument('--format', type=str.lower, choices=['yaml', 'yml', 'json'], default='yaml',
+                    help='write the output as YAML (yaml or yml: comments kept, nodes not found commented out) '
+                         'or JSON (default: yaml)')
     ap.add_argument('--debug', action='store_true',
                     help='write a report next to each output file (<output>.report.tsv): how every node was matched')
     args = ap.parse_args()
     output_format = {'yml': 'yaml'}.get(args.format, args.format)
 
-    todo = jobs(args.input, args.output)
+    todo = jobs(args.input, args.output, output_format == 'yaml')
     if not todo:
         raise SystemExit(f'no .xl file in {args.input}')
     source = open_export(args.source, args.versions_dir, args.release_url)
