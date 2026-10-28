@@ -1,5 +1,5 @@
 # Copyright © 2026 Aurélien "Akiway" Klein.
-"""Update ArchiveXL sector node removals from one game version to another.
+"""Update ArchiveXL sector node removals and mutations from one game version to another.
 
 Usage:
     python axl_sector_updater.py --from 2.31 --to 2.5 [input] [output] [options]
@@ -9,10 +9,12 @@ input / output are an .xl file or a folder (default: the input/ and output/ fold
 record per nodeData entry, see docs/NODE_RECORDS.md) are read from the versions/ folder and downloaded from the GitHub
 release when missing; a path to an export zip or unpacked folder also works.
 
-Every removal is looked up by what the node *is* (node family, resources, world position, debugName,
+Every removal and mutation is looked up by what the node *is* (node family, resources, world position, debugName,
 actor/instance positions) instead of by index, then written back with its new index, type, expectedNodes and
-remapped actorDeletions. With --debug, a report (<output>.report.tsv) lists how each removal was matched so that
-anything uncertain can be checked by hand.
+remapped actor / instance lists. The output is YAML written into the input text, so its comments stay; nodes not
+found are commented out with what they were in the source version. --format json rewrites the file as JSON instead.
+With --debug, a report (<output>.report.tsv) lists how each node was matched so that anything uncertain can be
+checked by hand.
 """
 import argparse, csv, functools, json, math, os, re, sys, urllib.error, urllib.request, zipfile
 from collections import defaultdict
