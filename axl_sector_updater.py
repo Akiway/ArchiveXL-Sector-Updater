@@ -14,7 +14,7 @@ actor/instance positions) instead of by index, then written back with its new in
 remapped actorDeletions. With --debug, a report (<output>.report.tsv) lists how each removal was matched so that
 anything uncertain can be checked by hand.
 """
-import argparse, csv, json, math, os, re, sys, urllib.error, urllib.request, zipfile
+import argparse, csv, functools, json, math, os, re, sys, urllib.error, urllib.request, zipfile
 from collections import defaultdict
 
 import yaml
@@ -50,6 +50,7 @@ def fnv1a64(text):
     return h
 
 
+@functools.lru_cache(maxsize=None)  # the same resources come back in thousands of records
 def resource_key(prop, value):
     """Resources compared by hash: cooked 2.5 data stores some names as FNV1a64 hashes, paths may be unresolved."""
     if value.isdigit():
@@ -102,8 +103,34 @@ class NodeExport:
     def sector(self, path):
         if path not in self._cache:
             lines = self._lines(path)
-            self._cache[path] = None if lines is None else [Record(json.loads(l)) for l in lines if l]
+            self._cache[path] = None if lines is None else Sector([l for l in lines if l])
         return self._cache[path]
+
+
+class Sector:
+    """Records of one sector, decoded on first access: from the source version, a removal only needs its own node."""
+    __slots__ = ('_lines', '_records', '_count')
+
+    def __init__(self, lines):
+        self._lines = lines
+        self._records = [None] * len(lines)
+        self._count = len(lines)
+
+    def __len__(self):
+        return self._count
+
+    def __getitem__(self, i):
+        record = self._records[i]
+        if record is None:
+            record = self._records[i] = Record(json.loads(self._lines[i]))
+        return record
+
+    def __iter__(self):
+        if self._lines is not None:
+            for i in range(self._count):
+                self[i]
+            self._lines = None  # all decoded
+        return iter(self._records)
 
 
 def download(url, dest):
@@ -324,8 +351,7 @@ def update(xl, source, target, radius, report):
                   f'{sector["expectedNodes"]}: it was not made for this source version', file=sys.stderr)
 
         here = target.sector(path)
-        around = [(p, target.sector(p)) for p in neighbours(path)]
-        around = [(p, r) for p, r in around if r is not None]
+        around = None  # neighbour sectors, loaded only when a node is not found in its own sector
 
         # Best candidate of every node first, then assign greedily so two removals never take the same node.
         wanted = []
@@ -344,6 +370,8 @@ def update(xl, source, target, radius, report):
                 note = ''
                 found = candidates(old, [(path, here)] if here else [], radius)
                 if not found or found[0][0] == 'moved':
+                    if around is None:
+                        around = [(p, r) for p in neighbours(path) if (r := target.sector(p)) is not None]
                     found = sorted(found + candidates(old, around, radius), key=lambda c: c[1])
                 wanted.append((kind, node, old, found, note))
 
