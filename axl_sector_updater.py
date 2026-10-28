@@ -275,13 +275,25 @@ def source_mismatch(node, old):
     return None
 
 
-def remap_elements(old, new, indices):
-    """Map old actor / instance indices to the new node's indices by world position."""
-    mapped, missing = [], []
+def element_index(entry):
+    """Actor / instance index of an element list entry: 3, [actor, shape] or {index: 3, position: ...}."""
+    return entry.get('index', -1) if isinstance(entry, dict) else entry[0] if isinstance(entry, list) else entry
+
+
+def with_element_index(entry, index):
+    if isinstance(entry, dict):
+        return {**entry, 'index': index}
+    return [index, *entry[1:]] if isinstance(entry, list) else index
+
+
+def remap_elements(old, new, entries):
+    """New actor / instance index of every entry, found by world position (None when not found)."""
+    mapped = []
     used = set()
-    for i in indices:
-        if old.elements is None or i >= len(old.elements):
-            missing.append(i)
+    for entry in entries:
+        i = element_index(entry)
+        if old.elements is None or not 0 <= i < len(old.elements):
+            mapped.append(None)
             continue
         best = min(((distance(old.elements[i], e), j) for j, e in enumerate(new.elements or []) if j not in used),
                    default=None)
@@ -289,13 +301,15 @@ def remap_elements(old, new, indices):
             mapped.append(best[1])
             used.add(best[1])
         else:
-            missing.append(i)
-    return sorted(mapped), missing
+            mapped.append(None)
+    return mapped
 
 
 # ---------------------------------------------------------------- xl file
 
-ELEMENT_KEYS = [('actorDeletions', 'expectedActors'), ('elementDeletions', 'expectedElements')]
+# Element lists read by ArchiveXL (deletions in nodeDeletions, mutations in nodeMutations) and their count key.
+ELEMENT_KEYS = [('actorDeletions', 'expectedActors'), ('instanceDeletions', 'expectedInstances'),
+                ('actorMutations', 'expectedActors'), ('instanceMutations', 'expectedInstances')]
 
 
 def load_xl(path):
@@ -326,8 +340,9 @@ def to_yaml(data):
 
 
 def update(xl, source, target, radius, report, label=''):
-    """Match every node of the file. Returns {(sector no, kind, node no): (new sector path, updated node)} for the
-    nodes found, (None, why) for the others, in the order they were assigned."""
+    """Match every node of the file. Returns {(sector no, kind, node no): (new sector path, updated node, remaps)}
+    for the nodes found, remaps giving the new index of each entry of their actor / instance lists (None when not
+    found); (None, why, None) for the others. In the order they were assigned."""
     outcome = {}
     in_sectors = xl['streaming']['sectors']
     show_progress = sys.stderr.isatty()  # no progress lines in redirected output
@@ -342,7 +357,7 @@ def update(xl, source, target, radius, report, label=''):
             for kind in ('nodeDeletions', 'nodeMutations'):
                 for n, node in enumerate(sector.get(kind) or []):
                     report.append(row(path, kind, node, None, 'not found', note='sector missing from the source export'))
-                    outcome[done, kind, n] = None, f'sector missing from the {source.version} export'
+                    outcome[done, kind, n] = None, f'sector missing from the {source.version} export', None
             continue
         if sector.get('expectedNodes') not in (None, len(old_records)):
             print(f'\rwarning: {path} has {len(old_records)} nodes in the source version, the file expects '
@@ -358,14 +373,14 @@ def update(xl, source, target, radius, report, label=''):
                 idx = node['index']
                 if idx >= len(old_records):
                     report.append(row(path, kind, node, None, 'not found', note='index out of range in the source version'))
-                    outcome[done, kind, n] = None, f'index out of range in {source.version}'
+                    outcome[done, kind, n] = None, f'index out of range in {source.version}', None
                     continue
                 old = old_records[idx]
                 mismatch = source_mismatch(node, old)
                 if mismatch:
                     # The file was not made for the source version (or the node changed): remapping would hit the wrong node.
                     report.append(row(path, kind, node, old, 'source mismatch', note=mismatch))
-                    outcome[done, kind, n] = None, f'does not match {source.version}: {mismatch}'
+                    outcome[done, kind, n] = None, f'does not match {source.version}: {mismatch}', None
                     continue
                 note = ''
                 found = candidates(old, [(path, here)] if here else [], radius)
@@ -380,7 +395,7 @@ def update(xl, source, target, radius, report, label=''):
             choice = next((c for c in found if (c[2], c[3].index) not in taken), None)
             if choice is None:
                 report.append(row(path, kind, node, old, 'not found', note=note))
-                outcome[done, kind, n] = None, not_found
+                outcome[done, kind, n] = None, not_found, None
                 continue
             level, _, new_path, new, details = choice
             taken.add((new_path, new.index))
@@ -392,18 +407,37 @@ def update(xl, source, target, radius, report, label=''):
             updated = dict(node)
             updated['type'] = new.type
             updated['index'] = new.index
+            remaps = {}  # list key -> new index of each entry, None when not found
             actors = ''
+            lost = None
             for list_key, count_key in ELEMENT_KEYS:
-                if list_key in node:
-                    mapped, missing = remap_elements(old, new, node[list_key])
-                    updated[list_key] = mapped
-                    updated[count_key] = len(new.elements or [])
-                    actors = f'{len(mapped)}/{len(node[list_key])}'
-                    if missing:
-                        note = (note + '; ' if note else '') + f'{list_key} not found: {missing}'
-                        if level == 'exact':
-                            level = 'match'
-            outcome[done, kind, n] = new_path, updated
+                entries = node.get(list_key)
+                if not isinstance(entries, list):
+                    continue
+                if old.elements is None and new.elements is None:
+                    # No actor data for this node type in the exports (foliage): the same node keeps its indices.
+                    note = (note + '; ' if note else '') + f'{list_key} kept as is: not in the node exports'
+                    if level == 'exact':
+                        level = 'match'
+                    continue
+                remaps[list_key] = mapped = remap_elements(old, new, entries)
+                updated[list_key] = [with_element_index(e, j) for e, j in zip(entries, mapped) if j is not None]
+                updated[count_key] = len(new.elements or [])
+                actors = f'{len(updated[list_key])}/{len(entries)}'
+                missing = [element_index(e) for e, j in zip(entries, mapped) if j is None]
+                if missing:
+                    note = (note + '; ' if note else '') + f'{list_key} not found: {missing}'
+                    if len(missing) == len(entries):
+                        lost = list_key
+                    if level == 'exact':
+                        level = 'match'
+            if lost:
+                # Without any of its actors / instances, a deletion would remove the whole node.
+                taken.discard((new_path, new.index))
+                report.append(row(path, kind, node, old, 'not found', new_path, new, details, actors, note))
+                outcome[done, kind, n] = None, f'none of its {lost[:-9]}s found in {target.version}', None
+                continue
+            outcome[done, kind, n] = new_path, updated, remaps
             report.append(row(path, kind, node, old, level, new_path, new, details, actors, note))
 
     if show_progress:
@@ -414,7 +448,7 @@ def update(xl, source, target, radius, report, label=''):
 def rebuild(xl, outcome, target):
     """The converted file as data: one entry per sector, sorted by path, nodes sorted by index."""
     out_sectors = {}
-    for (_, kind, _), (new_path, updated) in outcome.items():
+    for (_, kind, _), (new_path, updated, _) in outcome.items():
         if new_path is None:
             continue
         if new_path not in out_sectors:
@@ -447,7 +481,6 @@ def patch_yaml(text, xl, outcome, target):
     root = yaml.compose(text)
     edits = []  # (start, end, replacement) in the text
     kinds = ('nodeDeletions', 'nodeMutations')
-    count_list = {count_key: list_key for list_key, count_key in ELEMENT_KEYS}
 
     def fields(mapping):
         return {k.value: (k, v) for k, v in mapping.value}
@@ -489,12 +522,25 @@ def patch_yaml(text, xl, outcome, target):
             at = line_end(end_of(v) - 1)
             edits.append((at, at, f'\n{" " * k.start_mark.column}{key}: {flow(value)}'))
 
+    def renumber(values, mapped):
+        """Renumber a block list of actors / instances in place; the entries not found are commented out."""
+        for entry, j in zip(values.value, mapped):
+            if j is None:
+                comment_out(dash(entry), end_of(entry), f'not found in {target.version}')
+                continue
+            if isinstance(entry, yaml.MappingNode):
+                index = fields(entry)['index'][1]
+            else:
+                index = entry.value[0] if isinstance(entry, yaml.SequenceNode) else entry
+            if index.value != str(j):
+                edits.append((index.start_mark.index, index.end_mark.index, str(j)))
+
     def block(data, col):
         return ''.join(f'\n{" " * col}{line}' for line in to_yaml(data).splitlines())
 
     in_sectors = xl['streaming']['sectors']
     entries = fields(fields(root)['streaming'][1])['sectors'][1]
-    kept = {si for (si, _, _), (new_path, _) in outcome.items() if new_path == in_sectors[si]['path']}
+    kept = {si for (si, _, _), (new_path, _, _) in outcome.items() if new_path == in_sectors[si]['path']}
     home = {}  # sector path -> first entry keeping nodes there, which receives the nodes that moved to that sector
     for si in sorted(kept):
         home.setdefault(in_sectors[si]['path'], si)
@@ -516,11 +562,16 @@ def patch_yaml(text, xl, outcome, target):
             nodes = sector.get(k.value) or []
             gone = 0
             for n, (node, item) in enumerate(zip(nodes, v.value)):
-                new_path, updated = outcome[si, k.value, n]
+                new_path, updated, remaps = outcome[si, k.value, n]
                 if new_path == path:
+                    item_fields = fields(item)
                     for key, value in updated.items():
-                        if key not in node or node[key] != value:
-                            set_value(item, key, value, count_list.get(key, 'index'))
+                        values = item_fields.get(key, (None, None))[1]
+                        if key in remaps and isinstance(values, yaml.SequenceNode) and not values.flow_style:
+                            renumber(values, remaps[key])
+                        elif key not in node or node[key] != value:
+                            after = next((l for l, c in ELEMENT_KEYS if c == key and l in node), 'index')
+                            set_value(item, key, value, after)
                     continue
                 gone += 1
                 if new_path is None:
