@@ -74,7 +74,8 @@ indices, types and counts change.
 - **Nodes found in another sector** are commented out with `moved to <sector>` and added to that sector: to its
   entry in the file, or to a new entry at the end of the list.
 - **Actors and instances** (`actorDeletions`, `instanceDeletions`, `actorMutations`, `instanceMutations`) are found
-  again by world position, within 1 cm, and renumbered; `expectedActors` / `expectedInstances` get the new count. An
+  again by world position (within 1 cm), orientation and shape count / scale, and renumbered: several actors
+  often share a position; `expectedActors` / `expectedInstances` get the new count. An
   actor / instance not found is commented out of its list. A node that would keep none of the actors / instances it
   lists is left out (`not found`): with an empty list, ArchiveXL would remove the whole node.
 - **JSON input** is converted to YAML the same way. An output named after a `.json` file becomes `.xl`.

@@ -198,8 +198,15 @@ def same_orientation(a, b):
     return abs(sum(x * y for x, y in zip(a, b))) >= 0.9999
 
 
+def same_element(a, b):
+    """Same actor / instance: same world position, orientation and shape count / scale. Actors often share a
+    position and differ only by their orientation or shape count."""
+    return distance(a, b) <= ELEMENT_DISTANCE and (len(a) < 7 or same_orientation(a[3:7], b[3:7])) \
+        and all(abs(x - y) <= 1e-3 for x, y in zip(a[7:], b[7:]))
+
+
 def element_match(old, new):
-    """Fraction of old elements (actors / instances) found at the same world position in new."""
+    """Fraction of old elements (actors / instances) found in new (see same_element)."""
     if not old:
         return 1.0 if not new else 0.0
     if not new:
@@ -211,7 +218,7 @@ def element_match(old, new):
     for e in old:
         key = tuple(round(c / ELEMENT_DISTANCE) for c in e[:3])
         cells = [(key[0] + i, key[1] + j, key[2] + k) for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)]
-        if any(distance(e, n) <= ELEMENT_DISTANCE for c in cells for n in grid.get(c, ())):
+        if any(same_element(e, n) for c in cells for n in grid.get(c, ())):
             found += 1
     return found / len(old)
 
@@ -289,7 +296,8 @@ def with_element_index(entry, index):
 
 
 def remap_elements(old, new, entries):
-    """New actor / instance index of every entry, found by world position (None when not found)."""
+    """New actor / instance index of every entry, found by world transform (see same_element; None when not found).
+    Among identical elements, the closest index is kept."""
     mapped = []
     used = set()
     for entry in entries:
@@ -297,11 +305,12 @@ def remap_elements(old, new, entries):
         if old.elements is None or not 0 <= i < len(old.elements):
             mapped.append(None)
             continue
-        best = min(((distance(old.elements[i], e), j) for j, e in enumerate(new.elements or []) if j not in used),
-                   default=None)
-        if best and best[0] <= ELEMENT_DISTANCE:
-            mapped.append(best[1])
-            used.add(best[1])
+        e = old.elements[i]
+        best = min(((distance(e, n), abs(j - i), j) for j, n in enumerate(new.elements or [])
+                    if j not in used and same_element(e, n)), default=None)
+        if best:
+            mapped.append(best[2])
+            used.add(best[2])
         else:
             mapped.append(None)
     return mapped
