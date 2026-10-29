@@ -387,7 +387,11 @@ def update(xl, source, target, radius, report, label=''):
         wanted = []
         for kind in ('nodeDeletions', 'nodeMutations'):
             for n, node in enumerate(sector.get(kind) or []):
-                idx = node['index']
+                idx = node.get('index')
+                if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0:
+                    report.append(row(path, kind, node, None, 'not found', note=f'invalid index: {idx!r}'))
+                    outcome[done, kind, n] = None, f'invalid index: {idx!r}', None
+                    continue
                 if idx >= len(old_records):
                     report.append(row(path, kind, node, None, 'not found', note='index out of range in the source version'))
                     outcome[done, kind, n] = None, f'index out of range in {source.version}', None
