@@ -50,7 +50,7 @@ how many nodes got each status and lists every node that is not `exact`.
 | `exact` | found, identical (same type, resources, position within 1 cm, every actor / instance) | yes |
 | `match` | found, nearly identical (within 5 cm, or only part of its actors / instances found) | yes, **check it in game** |
 | `moved` | same object, moved by more than 5 cm (up to `--radius`, 2 m by default) | yes, **check it in game** |
-| `not found` | no such object in the new version, neither in the sector nor in its 26 neighbours, or none of the actors / instances it lists | commented out |
+| `not found` | no such object in the new version, neither in the sector, nor in its 26 neighbours, nor in the sectors of the other grid levels around it, or none of the actors / instances it lists | commented out |
 | `source mismatch` | the file does not match the `--from` version: it was made for another game version | commented out |
 
 ### The output file
@@ -72,12 +72,20 @@ indices, types and counts change.
   ```
 
 - **Nodes found in another sector** are commented out with `moved to <sector>` and added to that sector: to its
-  entry in the file, or to a new entry at the end of the list.
+  entry in the file, or to a new entry at the end of the list. 2.5 moved some nodes to a sector of another grid
+  level (`exterior_2_2_0_1` → `exterior_4_4_1_0`): they are found there too.
 - **Actors and instances** (`actorDeletions`, `instanceDeletions`, `actorMutations`, `instanceMutations`) are found
-  again by world position (within 1 cm), orientation and shape count / scale, and renumbered: several actors
-  often share a position; `expectedActors` / `expectedInstances` get the new count. An
+  again one by one, by world position (within 1 cm), orientation and shape count / scale, and renumbered: several
+  actors often share a position; `expectedActors` / `expectedInstances` get the new count. An
   actor / instance not found is commented out of its list. A node that would keep none of the actors / instances it
   lists is left out (`not found`): with an empty list, ArchiveXL would remove the whole node.
+- **Actors and instances moved to another node**: 2.5 regrouped the actors of many collision nodes, sometimes into a
+  node of another sector. The entry goes to the node that holds most of the actors it lists; the others are commented
+  out of its list with `moved to node <index> of <sector>`, and added to the file as an entry for that node. Each
+  source node keeps its own entries, even when several of them now point to the same node: ArchiveXL applies every
+  actor / instance list of a node.
+- **A node listed several times** (a removal and a mutation of the same node, two mutations…) keeps all its entries,
+  converted to the same node.
 - **JSON input** is converted to YAML the same way. An output named after a `.json` file becomes `.xl`.
 - **`--format json`** writes JSON instead, which cannot hold comments: one entry per sector, sorted by path, nodes
   sorted by index, nodes left out removed.
@@ -211,6 +219,8 @@ You don't need to. To look inside anyway, use 7-Zip: Windows Explorer does not s
   console and the report.
 - The node exports have no actor data for `worldFoliageNode`: its `actorDeletions` are kept as they are, and the
   node is reported as `match`.
+- The instances of `worldInstancedDestructibleMeshNode` and `worldInstancedOccluderNode` are stored relative to their
+  node: they only locate a node within `--radius` of the old one, and are never looked for in other nodes.
 
 ## Node exports (maintainers)
 
