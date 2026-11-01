@@ -31,8 +31,10 @@ CELL_SIZES = {'exterior_': 64, 'interior_': 32}
 GRID_LEVELS = range(5)
 # Their actors / instances are stored relative to the node: they only locate a node that did not move.
 RELATIVE_ELEMENTS = {'worldInstancedDestructibleMeshNode', 'worldInstancedOccluderNode'}
-LEVELS = ['exact', 'match', 'moved']  # best first; then "not found" and "source mismatch"
-STATUSES = LEVELS + ['not found', 'source mismatch']
+LEVELS = ['exact', 'match', 'moved']  # best first; then "already target", "not found" and "source mismatch"
+STATUSES = LEVELS + ['already target', 'not found', 'source mismatch']
+# Numbering at the end of a name: _001 in the game, .001 in Blender; also an empty _ before a closing brace.
+NUMBERING_RX = re.compile(r'([._]\d*)+$')
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSIONS_DIR = os.path.join(SCRIPT_DIR, 'versions')  # node exports, downloaded here when missing
@@ -302,14 +304,41 @@ def candidates(old, sectors, radius):
     return found
 
 
-def source_mismatch(node, old):
-    """Why the file's node does not describe the source node at its index, or None when it does."""
+def file_debug_name(node):
+    """debugName as written in the file, or None. An unquoted {name} reads as a YAML mapping."""
+    name = node.get('debugName')
+    if isinstance(name, dict):
+        return '{' + ', '.join(map(str, name)) + '}'
+    return None if name in (None, '', 'None') else str(name)
+
+
+def name_stem(name):
+    """A name without its folder, extension, braces, case and numbering: the game numbers its nodes
+    q302_lamp_003, Blender exports q302_lamp.003."""
+    name = re.sub(r'\.[a-z]+$', '', name.rsplit('\\', 1)[-1].lower()).replace('{', '').replace('}', '')
+    return NUMBERING_RX.sub('', name) or name
+
+
+def record_stems(record):
+    """Name stems of a record: its debugName and the file names of its resources."""
+    names = [record.debug_name] if record.debug_name else []
+    names += [v for v in (record.raw.get('r') or {}).values() if isinstance(v, str) and '\\' in v]
+    return {name_stem(n) for n in names}
+
+
+def source_mismatch(node, old, known):
+    """Why the file's node does not describe the node old at its index (of the source version, or of the target one
+    for a file that mixes both), or None when it does. known() gives the name stems of every node of the sector:
+    a debugName that names none of them (a generic Blender name such as dirt.001) says nothing."""
     file_type = node.get('type')
     if file_type and file_type.replace('worldCooked', 'world', 1) != old.family:
         return f'file says {file_type}, source node #{old.index} is {old.type}'
-    name = node.get('debugName')
-    if name not in (None, '', 'None') and old.debug_name is not None and name != old.debug_name:
-        return f"file says debugName '{name}', source node #{old.index} is '{old.debug_name}'"
+    name = file_debug_name(node)
+    if name and name != old.debug_name and (stems := record_stems(old)):
+        # Blender files list the instances of an instanced node: "can.001, can.002".
+        file_stems = {name_stem(n.strip()) for n in name.split(',') if n.strip()}
+        if not file_stems & stems and file_stems & known():
+            return f"file says debugName '{name}', source node #{old.index} is '{old.debug_name or ', '.join(sorted(stems))}'"
     for list_key, count_key in ELEMENT_KEYS:
         if count_key in node and old.elements is not None and node[count_key] != len(old.elements):
             return f'file expects {node[count_key]} {list_key[:-9]}s, source node #{old.index} has {len(old.elements)}'
@@ -441,6 +470,28 @@ def update(xl, source, target, radius, report, label=''):
     def farther(path, positions):
         return [(p, r) for p in other_levels(path, positions) if (r := target.sector(p)) is not None]
 
+    stems = {}  # sector path -> name stems of its nodes in both versions, built when a name does not fit its node
+
+    def known(path):
+        if path not in stems:
+            stems[path] = {s for export in (source, target) if (records := export.sector(path)) is not None
+                           for r in records for s in record_stems(r)}
+        return stems[path]
+
+    def in_target(key, path, node, old, why):
+        """A file that mixes versions: keep the node as it is when it describes the target node at its index."""
+        here = target.sector(path)
+        idx = node['index']
+        new = here[idx] if here is not None and idx < len(here) else None
+        if new is None or source_mismatch(node, new, lambda: known(path)):
+            return False
+        updated = dict(node)
+        updated['type'] = new.type
+        outcome[key] = path, updated, {}
+        rows[key] = row(path, key[1], node, old, 'already target', path, new,
+                        similarity(old, new) if old else None, note=f'{why}; matches node #{idx} of {target.version}')
+        return True
+
     # Candidates of every node first (a node the file lists several times is looked up once), then assign them.
     searched = {}  # (sector path, source index) -> candidates
     wanted = []
@@ -466,15 +517,18 @@ def update(xl, source, target, radius, report, label=''):
                     fail((done, kind, n), path, node, None, f'invalid index: {idx!r}', note=f'invalid index: {idx!r}')
                     continue
                 if idx >= len(old_records):
-                    fail((done, kind, n), path, node, None, f'index out of range in {source.version}',
-                         note='index out of range in the source version')
+                    if not in_target((done, kind, n), path, node, None, 'index out of range in the source version'):
+                        fail((done, kind, n), path, node, None, f'index out of range in {source.version}',
+                             note='index out of range in the source version')
                     continue
                 old = old_records[idx]
-                mismatch = source_mismatch(node, old)
+                mismatch = source_mismatch(node, old, lambda: known(path))
+                if mismatch and in_target((done, kind, n), path, node, old, mismatch):
+                    continue
                 if mismatch:
                     # The file was not made for the source version (or the node changed): remapping would hit the wrong node.
-                    fail((done, kind, n), path, node, old, f'does not match {source.version}: {mismatch}',
-                         'source mismatch', mismatch)
+                    fail((done, kind, n), path, node, old, f'does not match {source.version} (nor {target.version} '
+                         f'at this index): {mismatch}', 'source mismatch', mismatch)
                     continue
                 if (path, idx) not in searched:
                     here = target.sector(path)
@@ -809,7 +863,7 @@ def row(path, kind, node, old, status, new_path=None, new=None, details=None, ac
         'kind': kind,
         'old_index': node.get('index'),
         'old_type': node.get('type'),
-        'debugName': node.get('debugName') or (old.debug_name if old else ''),
+        'debugName': file_debug_name(node) or (old.debug_name if old else ''),
         'new_sector': '' if new_path in (None, path) else new_path.rsplit('\\', 1)[-1],
         'new_index': '' if new is None else new.index,
         'new_type': '' if new is None else new.type,
