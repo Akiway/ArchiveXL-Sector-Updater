@@ -40,6 +40,8 @@ The first run downloads the game data of both versions (`nodes-2.31.zip` and `no
 the [`node-exports`](https://github.com/Akiway/ArchiveXL-Sector-Updater/releases/tag/node-exports) release into the
 `versions` folder. Later runs reuse them.
 
+Available versions: `1.63`, `2.02`, `2.13`, `2.2`, `2.21`, `2.31`, `2.5`.
+
 ### Reading the result
 
 While a file is converted, the console shows its progress (`INCF.xl: 523 / 1953 sectors (26%)`). Then it prints
@@ -175,13 +177,13 @@ The terminal is not in the tool folder. Open it from the folder (Installation, s
 The `input` folder is empty. Put your files in it, or give the file path in the command (see [Options](#options)).
 
 **`download interrupted`, or the download is stuck**
-Run the command again. You can also download `nodes-2.31.zip` and `nodes-2.5.zip` by hand from the
+Run the command again. You can also download the `nodes-<version>.zip` of both versions by hand from the
 [`node-exports`](https://github.com/Akiway/ArchiveXL-Sector-Updater/releases/tag/node-exports) release and put
 them, still zipped, in the `versions` folder.
 
 **`no node export for game version …` / `neither a game version nor an existing node export`**
-Check the version numbers: write `2.31` and `2.5`, not `2.3.1` or `v2.5`. Only the versions listed on the
-`node-exports` release are available.
+Check the version numbers: write `2.31` and `2.5`, not `2.3.1` or `v2.5`. Only these versions are available:
+`1.63`, `2.02`, `2.13`, `2.2`, `2.21`, `2.31`, `2.5`.
 
 **`the output would overwrite the input`**
 Choose another output file or folder than the input.
