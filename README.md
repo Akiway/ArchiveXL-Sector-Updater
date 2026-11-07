@@ -53,8 +53,9 @@ how many nodes got each status and lists every node that is not `exact`.
 | `match` | found, nearly identical (within 5 cm, or only part of its actors / instances found) | yes, **check it in game** |
 | `moved` | same object, moved by more than 5 cm (up to `--radius`, 2 m by default) | yes, **check it in game** |
 | `not found` | no such object in the new version, neither in the sector, nor in its 26 neighbours, nor in the sectors of the other grid levels around it, or none of the actors / instances it lists | commented out |
+| `by name` | the node at its index does not match the `--from` version, but its debugName names one other node of the sector: that node was converted (see below) | yes, **check it in game** |
 | `already target` | the node does not match the `--from` version but matches the `--to` one at the same index: the file mixes both versions (see below) | yes, index kept, type updated |
-| `source mismatch` | the node matches neither the `--from` version nor the `--to` one at its index: the file was made for another game version | commented out |
+| `source mismatch` | the node matches neither the `--from` version nor the `--to` one at its index, and its debugName names no single other node: the file was made for another game version | commented out |
 
 A node matches a version when the node at its index has the same type, the same actor / instance count
 (`expectedActors`, `expectedInstances`) and, when the file gives one, a fitting debugName. Names are compared without
@@ -80,6 +81,21 @@ indices, types and counts change.
           #   type: worldStaticDecalNode
   ```
 
+- **Nodes found by name** (`by name`): an index can be wrong in the file (an entry copied from another one, or
+  numbered by another tool) while its debugName is what the author saw. When the node at its index does not fit, the
+  node of the `--from` sector that the name names is converted instead, under a comment that gives both:
+
+  ```yaml
+      # axl_sector_updater: found by its debugName (node #523 'drink_bottle_r_gusano.mesh' in 2.2): index 501 of the file is 'computer_panels_mlt_g.mesh'
+      - index: 525
+        type: worldInstancedMeshNode
+        debugName: drink_bottle_r_gusano.mesh
+  ```
+
+  Best first: a node whose debugName is that name (Blender numbering `.001` read as `_001`), then a node whose
+  resource file is, of the same type and actor / instance count; nodes listed by other entries of the file are
+  skipped. A name that only shares its stem (`magazine_i.001` and `magazine_i_002`) is taken only when a single node
+  of the sector has it. When several nodes fit equally, the node stays `source mismatch` and its comment lists them.
 - **Files that mix versions**: a file edited in both versions (a 2.31 removal list completed in 2.5) has nodes that
   already point to the right `--to` node. They are kept at their index (`already target`), with the `--to` type
   (`worldCookedStaticDecalNode`…), and the others are converted.
@@ -206,7 +222,8 @@ WolvenKit or in game and add it by hand if you still need it.
 The file was made for another game version than `--from` (for example a 2.3 file converted with `--from 2.31`).
 Run again with the right version. If that version is not on the `node-exports` release, these nodes cannot be
 converted automatically. A few isolated `source mismatch` nodes in a file that otherwise converts usually have a
-debugName that names a nearby node: the index or the name was wrong in the file; check them by hand.
+wrong index or name in the file: when their debugName names one node of the sector, they are converted as `by name`;
+otherwise the comment lists the nodes the name could designate: check them by hand.
 
 **Some nodes are `already target`**
 The file was partly made for the `--to` version already: these nodes are kept at their index. Check them in game if

@@ -31,8 +31,8 @@ CELL_SIZES = {'exterior_': 64, 'interior_': 32}
 GRID_LEVELS = range(5)
 # Their actors / instances are stored relative to the node: they only locate a node that did not move.
 RELATIVE_ELEMENTS = {'worldInstancedDestructibleMeshNode', 'worldInstancedOccluderNode'}
-LEVELS = ['exact', 'match', 'moved']  # best first; then "already target", "not found" and "source mismatch"
-STATUSES = LEVELS + ['already target', 'not found', 'source mismatch']
+LEVELS = ['exact', 'match', 'moved']  # best first; then "by name", "already target", "not found", "source mismatch"
+STATUSES = LEVELS + ['by name', 'already target', 'not found', 'source mismatch']
 # Numbering at the end of a name: _001 in the game, .001 in Blender; also an empty _ before a closing brace.
 NUMBERING_RX = re.compile(r'([._]\d*)+$')
 
@@ -326,6 +326,48 @@ def record_stems(record):
     return {name_stem(n) for n in names}
 
 
+def whole_name(name):
+    """A name compared as a whole: without folder, extension, braces and case; Blender numbering .001 reads _001."""
+    name = re.sub(r'\.[a-z]+$', '', name.rsplit('\\', 1)[-1].lower()).replace('{', '').replace('}', '').strip()
+    return re.sub(r'\.(\d+)', r'_\1', name)
+
+
+def describe(record):
+    """debugName of a record, or the file name of its first resource when it has none."""
+    name = record.debug_name or next((v for v in (record.raw.get('r') or {}).values()
+                                      if isinstance(v, str) and '\\' in v), f'#{record.index}')
+    return name.rsplit('\\', 1)[-1]
+
+
+def named_nodes(node, records):
+    """The nodes of records that the file's debugName names, best first: [(rank, record)]. Rank 0: the node's
+    debugName is that name; 1: one of its resource files is; 2: its name stem is. Same family and actor / instance
+    count as the file says. For a node whose index does not fit: the index can be wrong in the file, the name is
+    what the author saw."""
+    name = file_debug_name(node)
+    if not name:
+        return []
+    names = [n.strip() for n in name.split(',') if n.strip()]
+    whole = {whole_name(n) for n in names}
+    stems = {name_stem(n) for n in names}
+    file_type = node.get('type')
+    family = file_type.replace('worldCooked', 'world', 1) if file_type else None
+    found = []
+    for r in records:
+        if family and r.family != family:
+            continue
+        if any(count_key in node and r.elements is not None and node[count_key] != len(r.elements)
+               for _, count_key in ELEMENT_KEYS):
+            continue
+        if r.debug_name and whole_name(r.debug_name) in whole:
+            found.append((0, r))
+        elif any(whole_name(v) in whole for v in (r.raw.get('r') or {}).values() if isinstance(v, str) and '\\' in v):
+            found.append((1, r))
+        elif record_stems(r) & stems:
+            found.append((2, r))
+    return sorted(found, key=lambda f: f[0])
+
+
 def source_mismatch(node, old, known):
     """Why the file's node does not describe the node old at its index (of the source version, or of the target one
     for a file that mixes both), or None when it does. known() gives the name stems of every node of the sector:
@@ -429,11 +471,12 @@ def to_yaml(data):
 
 
 def update(xl, source, target, radius, report, label=''):
-    """Match every node of the file. Returns (outcome, extras).
+    """Match every node of the file. Returns (outcome, extras, notes).
     outcome: {(sector no, kind, node no): (new sector path, updated node, remaps)} for the nodes found, remaps giving
     for each entry of their actor / instance lists its new index, None when not found, or (sector path, node index)
     when the target version moved it to another node; (None, why, None) for the others.
-    extras: [(sector path, kind, node)], the entries added for the actors / instances moved to another node."""
+    extras: [(sector path, kind, node)], the entries added for the actors / instances moved to another node.
+    notes: {key: comment} for the nodes found by their debugName instead of their index ("by name")."""
     outcome = {}
     rows = {}     # same keys as outcome: report rows, written in the order of the file
     extras = []
@@ -492,6 +535,42 @@ def update(xl, source, target, radius, report, label=''):
                         similarity(old, new) if old else None, note=f'{why}; matches node #{idx} of {target.version}')
         return True
 
+    renamed = {}  # key -> why the node was taken by its debugName rather than its index
+    claims = {}   # (sector path, kind) -> source indices taken: by entries that fit their index, or by name
+
+    def claimed(path, kind, sector, records):
+        if (path, kind) not in claims:
+            claims[path, kind] = {
+                n['index'] for n in sector.get(kind) or []
+                if isinstance(n.get('index'), int) and not isinstance(n['index'], bool) and 0 <= n['index'] < len(records)
+                and not source_mismatch(n, records[n['index']], lambda: known(path))}
+        return claims[path, kind]
+
+    def by_name(key, path, sector, node, records):
+        """The source node that the file's debugName names when its index does not fit, or (None, note)."""
+        taken = claimed(path, key[1], sector, records)
+        found = named_nodes(node, records)
+        free = [(rank, r) for rank, r in found if r.index not in taken]
+        if not free:
+            listed = [r.index for rank, r in found if rank == found[0][0]] if found else []
+            if not listed:
+                return None, ''
+            nodes = ', '.join(f'#{i}' for i in listed)
+            return None, f'its debugName names node {nodes}, already listed' if len(listed) == 1 \
+                else f'its debugName names nodes {nodes}, all already listed'
+        rank = free[0][0]
+        # A full name (debugName, resource file) is taken among the nodes no other entry lists; a name stem only
+        # when a single node of the sector has it.
+        best = [r for k, r in (free if rank < 2 else found) if k == rank]
+        if len(best) > 1:
+            return None, f'its debugName names nodes {", ".join(f"#{r.index}" for r in best)} of {source.version}'
+        new_old = best[0]
+        taken.add(new_old.index)
+        here = f"'{describe(records[node['index']])}'" if node['index'] < len(records) else 'out of range'
+        renamed[key] = f"found by its debugName (node #{new_old.index} '{describe(new_old)}' in {source.version}): " \
+                       f"index {node['index']} of the file is {here}"
+        return new_old, ''
+
     # Candidates of every node first (a node the file lists several times is looked up once), then assign them.
     searched = {}  # (sector path, source index) -> candidates
     wanted = []
@@ -517,19 +596,31 @@ def update(xl, source, target, radius, report, label=''):
                     fail((done, kind, n), path, node, None, f'invalid index: {idx!r}', note=f'invalid index: {idx!r}')
                     continue
                 if idx >= len(old_records):
-                    if not in_target((done, kind, n), path, node, None, 'index out of range in the source version'):
-                        fail((done, kind, n), path, node, None, f'index out of range in {source.version}',
-                             note='index out of range in the source version')
-                    continue
-                old = old_records[idx]
-                mismatch = source_mismatch(node, old, lambda: known(path))
-                if mismatch and in_target((done, kind, n), path, node, old, mismatch):
-                    continue
-                if mismatch:
-                    # The file was not made for the source version (or the node changed): remapping would hit the wrong node.
-                    fail((done, kind, n), path, node, old, f'does not match {source.version} (nor {target.version} '
-                         f'at this index): {mismatch}', 'source mismatch', mismatch)
-                    continue
+                    if in_target((done, kind, n), path, node, None, 'index out of range in the source version'):
+                        continue
+                    old, why = by_name((done, kind, n), path, sector, node, old_records)
+                    if old is None:
+                        note = '; '.join(filter(None, ['index out of range in the source version', why]))
+                        fail((done, kind, n), path, node, None, f'index out of range in {source.version}'
+                             + (f': {why}' if why else ''), note=note)
+                        continue
+                else:
+                    old = old_records[idx]
+                    mismatch = source_mismatch(node, old, lambda: known(path))
+                    if mismatch and in_target((done, kind, n), path, node, old, mismatch):
+                        continue
+                    if mismatch:
+                        # The index may be wrong in the file: the node its debugName names, if only one does.
+                        named, why = by_name((done, kind, n), path, sector, node, old_records)
+                        if named is None:
+                            # The file was not made for the source version (or the node changed): remapping would
+                            # hit the wrong node.
+                            note = '; '.join(filter(None, [mismatch, why]))
+                            fail((done, kind, n), path, node, old, f'does not match {source.version} (nor '
+                                 f'{target.version} at this index): {note}', 'source mismatch', note)
+                            continue
+                        old = named
+                idx = old.index
                 if (path, idx) not in searched:
                     here = target.sector(path)
                     found = candidates(old, [(path, here)] if here else [], radius)
@@ -671,11 +762,22 @@ def update(xl, source, target, radius, report, label=''):
         outcome[key] = new_path, updated, remaps
         rows[key] = row(path, kind, node, old, level, new_path, new, details, ' '.join(actors), note)
 
+    notes = {}  # key -> comment written above the converted node
+    for key, why in renamed.items():
+        r = rows[key]
+        r['note'] = '; '.join(filter(None, [why, r['status'] if r['status'] in LEVELS else '', r['note']]))
+        new_path, updated, remaps = outcome[key]
+        if r['status'] in LEVELS:
+            r['status'] = 'by name'
+            notes[key] = why
+        elif new_path is None:  # found by name in the source version, then not in the target one
+            outcome[key] = None, f'{why}\n{updated}', None
+
     kinds = ('nodeDeletions', 'nodeMutations')
     report.extend(rows[k] for k in sorted(rows, key=lambda k: (k[0], kinds.index(k[1]), k[2])))
     if show_progress:
         print(f'\r{label}: {len(in_sectors)} / {len(in_sectors)} sectors (100%)', file=sys.stderr)
-    return outcome, extras
+    return outcome, extras, notes
 
 
 def rebuild(xl, outcome, extras, target):
@@ -708,10 +810,12 @@ def flow(value):
     return '[' + ', '.join(map(str, value)) + ']' if isinstance(value, list) else str(value)
 
 
-def patch_yaml(text, xl, outcome, extras, target):
+def patch_yaml(text, xl, outcome, extras, target, notes=None):
     """The converted file as YAML, written into the input text so that its comments, order and layout stay.
     A node without a match is commented out where it was, with the reason; a node found in another sector is
-    commented out too and added to that sector, like the extras (actors / instances moved to another node)."""
+    commented out too and added to that sector, like the extras (actors / instances moved to another node).
+    notes: {key: comment} written above the nodes kept in their sector."""
+    notes = notes or {}
     root = yaml.compose(text)
     edits = []  # (start, end, replacement) in the text
     kinds = ('nodeDeletions', 'nodeMutations')
@@ -803,6 +907,9 @@ def patch_yaml(text, xl, outcome, extras, target):
             for n, (node, item) in enumerate(zip(nodes, v.value)):
                 new_path, updated, remaps = outcome[si, k.value, n]
                 if new_path == path:
+                    if (si, k.value, n) in notes:
+                        a = line_start(dash(item))
+                        edits.append((a, a, f'{" " * (dash(item) - a)}# axl_sector_updater: {notes[si, k.value, n]}\n'))
                     item_fields = fields(item)
                     for key, value in updated.items():
                         values = item_fields.get(key, (None, None))[1]
@@ -920,13 +1027,13 @@ def convert(input_path, output_path, source, target, radius, debug, output_forma
     if os.path.abspath(input_path) == os.path.abspath(output_path):
         raise SystemExit(f'{input_path}: the output would overwrite the input')
     report = []
-    outcome, extras = update(xl, source, target, radius, report, os.path.basename(input_path))
+    outcome, extras, notes = update(xl, source, target, radius, report, os.path.basename(input_path))
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
         if output_format == 'json':
             json.dump(rebuild(xl, outcome, extras, target), f, indent=2, ensure_ascii=False)
         else:
-            f.write(patch_yaml(to_yaml(xl) if in_json else text, xl, outcome, extras, target))
+            f.write(patch_yaml(to_yaml(xl) if in_json else text, xl, outcome, extras, target, notes))
     if debug:
         with open(output_path + '.report.tsv', 'w', encoding='utf-8', newline='') as f:
             w = csv.DictWriter(f, fieldnames=list(report[0].keys()) if report else ['status'], delimiter='\t')
