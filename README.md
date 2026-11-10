@@ -34,7 +34,9 @@ again by what it **is** (type, resources, position, name, actors / instances), t
 
    `--from` is the game version your files were made for, `--to` the version to convert them to. A file that starts
    with a `# Game version: <version>` line (as the converted files do) is converted from that version instead, so a
-   file converted before can go on to a newer version without `--from` (see [Options](#options)).
+   file converted before can go on to a newer version without `--from` (see [Options](#options)). When there is no
+   node export for that version (or it cannot be downloaded), the file is skipped and listed at the end, the others
+   are converted; `--force-from` converts it from `--from` instead.
 3. The converted files are in the `output` folder, with the same folder layout as `input`. They are YAML files with
    your comments kept (see [The output file](#the-output-file)).
 
@@ -68,8 +70,9 @@ one of them does. A name that names no node of the sector, such as a generic `di
 ### The output file
 
 The output is the input file with the new values written in: its comments, order and layout stay, only the
-indices, types and counts change. Its first line gives the game version it is now made for, in place of the
-`# Game version:` line of the input, if any; the next conversion reads it as the version to convert from:
+indices, types and counts change. A `# Game version:` line gives the game version it is now made for: the line of
+the input is updated where it is, anywhere in the comments that open the file (under a copyright, for example), or
+added as the first line when the input has none. The next conversion reads it as the version to convert from:
 
 ```yaml
 # Game version: 2.5

@@ -144,45 +144,56 @@ class Sector:
         return iter(self._records)
 
 
+class ExportError(Exception):
+    """A node export that cannot be opened: missing from the release, download failed, wrong version or schema."""
+
+
 def download(url, dest):
     tmp = dest + '.part'
     print(f'downloading {url}', file=sys.stderr)
-    with urllib.request.urlopen(url) as r, open(tmp, 'wb') as f:
-        total = int(r.headers.get('Content-Length') or 0)
-        done = 0
-        while chunk := r.read(1 << 20):
-            f.write(chunk)
-            done += len(chunk)
-            print(f'\r  {done / 2**20:.0f} / {total / 2**20:.0f} MiB', end='', file=sys.stderr)
-    print(file=sys.stderr)
-    if total and done != total:
-        os.remove(tmp)
-        raise SystemExit(f'download interrupted: {done} of {total} bytes')
-    os.replace(tmp, dest)
+    try:
+        with urllib.request.urlopen(url) as r, open(tmp, 'wb') as f:
+            total = int(r.headers.get('Content-Length') or 0)
+            done = 0
+            while chunk := r.read(1 << 20):
+                f.write(chunk)
+                done += len(chunk)
+                print(f'\r  {done / 2**20:.0f} / {total / 2**20:.0f} MiB', end='', file=sys.stderr)
+        print(file=sys.stderr)
+        if total and done != total:
+            raise ExportError(f'download interrupted: {done} of {total} bytes')
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):  # failed or interrupted (Ctrl+C included): no partial file left
+            os.remove(tmp)
 
 
 def open_export(spec, versions_dir, release_url):
-    """spec: a game version (<versions_dir>/nodes-<version>.zip, downloaded when missing), or a zip / unpacked folder."""
+    """spec: a game version (<versions_dir>/nodes-<version>.zip, downloaded when missing), or a zip / unpacked folder.
+    Raises ExportError when it cannot be opened."""
     if os.path.exists(spec):
         export = NodeExport(spec)
     elif VERSION_RX.match(spec):
         path = os.path.join(versions_dir, nodes_zip_name(spec))
         if not os.path.exists(path):
             os.makedirs(versions_dir, exist_ok=True)
+            local = ', '.join(sorted(n for n in os.listdir(versions_dir) if n.endswith('.zip'))) or 'none'
             try:
                 download(release_url + nodes_zip_name(spec), path)
             except urllib.error.HTTPError as e:
-                local = sorted(n for n in os.listdir(versions_dir) if n.endswith('.zip'))
-                raise SystemExit(f'no node export for game version {spec} (HTTP {e.code} from {release_url}); '
-                                 f'in {versions_dir}: {", ".join(local) or "none"}')
+                raise ExportError(f'no node export for game version {spec} (HTTP {e.code} from {release_url}); '
+                                  f'in {versions_dir}: {local}') from None
+            except OSError as e:  # no connection, timeout, connection lost
+                raise ExportError(f'could not download the node export of game version {spec} from {release_url} '
+                                  f'({getattr(e, "reason", None) or e}); in {versions_dir}: {local}') from None
         export = NodeExport(path)
         if export.manifest.get('game_version') != spec:
-            raise SystemExit(f'{path} is the export of game version {export.manifest.get("game_version")}, not {spec}')
+            raise ExportError(f'{path} is the export of game version {export.manifest.get("game_version")}, not {spec}')
     else:
-        raise SystemExit(f'{spec}: neither a game version nor an existing node export')
+        raise ExportError(f'{spec}: neither a game version nor an existing node export')
     schema = export.manifest.get('schema', NODES_SCHEMA)
     if schema != NODES_SCHEMA:
-        raise SystemExit(f'{export.location} uses record schema {schema}, this script reads schema {NODES_SCHEMA}')
+        raise ExportError(f'{export.location} uses record schema {schema}, this script reads schema {NODES_SCHEMA}')
     return export
 
 
@@ -512,10 +523,12 @@ def header_version(path):
 
 
 def with_header(text, version):
-    """The YAML output with a first line giving its game version, in place of the header of the input, if any."""
+    """The YAML output with its game version: the header of the input updated where it is (under a copyright, for
+    example), or a first line when it has none."""
+    line = f'# Game version: {version}\n'
     if header := find_header(text):
-        text = text[:header[0]] + text[header[1]:]
-    return f'# Game version: {version}\n' + text
+        return text[:header[0]] + line + text[header[1]:]
+    return line + text
 
 
 def load_xl(path):
@@ -1183,13 +1196,31 @@ def main():
     if missing:
         raise SystemExit('no game version for ' + ', '.join(missing) + ': give --from, or put a '
                          '"# Game version: <version>" line at the top of the file')
-    sources = {spec: open_export(spec, args.versions_dir, args.release_url) for spec in dict.fromkeys(p[2] for p in plan)}
-    target = open_export(args.target, args.versions_dir, args.release_url)
+    try:
+        target = open_export(args.target, args.versions_dir, args.release_url)
+    except ExportError as e:
+        raise SystemExit(f'--to {args.target}: {e}')
+    # A version that --from gives is a mistake in the command: stop. One that only a file's header gives skips the
+    # files that have it.
+    sources, unavailable = {}, {}
+    for spec in dict.fromkeys(p[2] for p in plan):
+        try:
+            sources[spec] = open_export(spec, args.versions_dir, args.release_url)
+        except ExportError as e:
+            if spec == args.source:
+                raise SystemExit(f'--from {spec}: {e}')
+            unavailable[spec] = e
+            print(f'warning: {e}', file=sys.stderr)
     versions = [s.version for s in sources.values() if s.version != target.version] or [target.version]
     print(f"{', '.join(versions)} -> {target.version}, {len(todo)} file(s)")
 
     totals = defaultdict(int)
+    skipped = []  # files whose game version has no node export
     for input_path, output_path, spec, from_header in plan:
+        if spec in unavailable:
+            print(f'\n{input_path}: its "# Game version: {spec}" line names a version without node export, skipped')
+            skipped.append(input_path)
+            continue
         source = sources[spec]
         if source.version == target.version:
             print(f'\n{input_path}: already made for game version {target.version}'
@@ -1219,6 +1250,13 @@ def main():
         print(f'  -> {output_path}')
     if len(todo) > 1:
         print(f'\ntotal {sum(totals.values())} nodes: ' + ', '.join(f'{totals[s]} {s}' for s in STATUSES if totals[s]))
+    if skipped:
+        versions = ', '.join(unavailable)
+        print(f'\n{len(skipped)} file(s) not converted, no node export for game version {versions} '
+              '(see the warning above; --force-from converts them from --from):')
+        for path in skipped:
+            print(f'  {path}')
+        sys.exit(1)
 
 
 if __name__ == '__main__':
