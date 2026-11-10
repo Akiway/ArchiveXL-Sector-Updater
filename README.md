@@ -32,7 +32,9 @@ again by what it **is** (type, resources, position, name, actors / instances), t
    py -3.14 axl_sector_updater.py --from 2.31 --to 2.5
    ```
 
-   `--from` is the game version your files were made for, `--to` the version to convert them to.
+   `--from` is the game version your files were made for, `--to` the version to convert them to. A file that starts
+   with a `# Game version: <version>` line (as the converted files do) is converted from that version instead, so a
+   file converted before can go on to a newer version without `--from` (see [Options](#options)).
 3. The converted files are in the `output` folder, with the same folder layout as `input`. They are YAML files with
    your comments kept (see [The output file](#the-output-file)).
 
@@ -66,7 +68,13 @@ one of them does. A name that names no node of the sector, such as a generic `di
 ### The output file
 
 The output is the input file with the new values written in: its comments, order and layout stay, only the
-indices, types and counts change.
+indices, types and counts change. Its first line gives the game version it is now made for, in place of the
+`# Game version:` line of the input, if any; the next conversion reads it as the version to convert from:
+
+```yaml
+# Game version: 2.5
+streaming:
+```
 
 - **Nodes left out** (`not found`, `source mismatch`) are commented out where they were, under a line that gives the
   reason. For a node not found, a second line tells what it was in the `--from` version, to look for it by hand in
@@ -139,7 +147,8 @@ py -3.14 axl_sector_updater.py --from 2.31 --to 2.5 "...\source\resources" "...\
 |---|---|---|
 | `input` | file or folder to convert (subfolders included) | `input` |
 | `output` | output file or folder | `output` |
-| `--from <version>` | game version the files were made for (`2.31`…), or path to a node export (zip or folder) | required |
+| `--from <version>` | game version the files were made for (`2.31`…), or path to a node export (zip or folder); a file whose first lines give its version (`# Game version: 2.31`) uses that one instead | required for the files without that line |
+| `--force-from` | uses `--from` for every file, even those with a `# Game version:` line | off |
 | `--to <version>` | target game version (`2.5`…), or path to a node export | required |
 | `--format <yaml\|yml\|json>` | writes the content as YAML or JSON (see [The output file](#the-output-file)) | `yaml` |
 | `--debug` | writes a `<name>.report.tsv` report next to each converted file (see below) | off |

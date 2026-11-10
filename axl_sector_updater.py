@@ -5,7 +5,8 @@ Usage:
     python axl_sector_updater.py --from 2.31 --to 2.5 [input] [output] [options]
 
 input / output are an .xl file or a folder (default: the input/ and output/ folders next to this script).
---from / --to are game versions. Their node exports (nodes-<version>.zip: one <sector path>.jsonl per sector, one
+--from / --to are game versions. A file whose opening comments give its version ("# Game version: 2.31", written at
+the top of every YAML output) is converted from that version instead of --from, unless --force-from. Their node exports (nodes-<version>.zip: one <sector path>.jsonl per sector, one
 record per nodeData entry, see docs/NODE_RECORDS.md) are read from the versions/ folder and downloaded from the GitHub
 release when missing; a path to an export zip or unpacked folder also works.
 
@@ -477,17 +478,53 @@ ELEMENT_KEYS = [('actorDeletions', 'expectedActors'), ('instanceDeletions', 'exp
                 ('actorMutations', 'expectedActors'), ('instanceMutations', 'expectedInstances')]
 
 
-def load_xl(path):
+def read_text(path, warn=True):
     raw = open(path, 'rb').read()
     try:
-        text = raw.decode('utf-8-sig')
+        return raw.decode('utf-8-sig')
     except UnicodeDecodeError:
         # Raw bytes written as debugNames by some tools (see corrupted_name): read as U+FFFD, replaced later.
-        text = raw.decode('utf-8-sig', errors='replace')
-        print(f'warning: {path} is not valid UTF-8 (corrupted debugNames?)', file=sys.stderr)
+        if warn:
+            print(f'warning: {path} is not valid UTF-8 (corrupted debugNames?)', file=sys.stderr)
+        return raw.decode('utf-8-sig', errors='replace')
+
+
+HEADER_RX = re.compile(r'#\s*game version\s*:\s*(?P<version>\S+)', re.IGNORECASE)
+
+
+def find_header(text):
+    """(start, end, version) of the '# Game version: <version>' line among the comments that open the file, or None."""
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped and not stripped.startswith('#'):
+            return None
+        if m := HEADER_RX.fullmatch(stripped):
+            return pos, pos + len(line), m['version']
+        pos += len(line)
+    return None
+
+
+def header_version(path):
+    """Game version that the file's header gives (see find_header), or None."""
+    header = find_header(read_text(path, warn=False))
+    return header[2] if header else None
+
+
+def with_header(text, version):
+    """The YAML output with a first line giving its game version, in place of the header of the input, if any."""
+    if header := find_header(text):
+        text = text[:header[0]] + text[header[1]:]
+    return f'# Game version: {version}\n' + text
+
+
+def load_xl(path):
+    text = read_text(path)
     # Hand-edited files can carry trailing tabs, which ArchiveXL tolerates but PyYAML rejects.
     text = '\n'.join(line.rstrip() for line in text.splitlines()) + '\n'
-    return yaml.safe_load(text), text.lstrip().startswith('{'), text
+    # JSON, maybe under comments (a "# Game version:" line added by hand): rewritten as YAML from the data.
+    in_json = '\n'.join(l for l in text.splitlines() if not l.lstrip().startswith('#')).lstrip().startswith('{')
+    return yaml.safe_load(text), in_json, text
 
 
 class IndentDumper(yaml.SafeDumper):
@@ -1091,12 +1128,14 @@ def convert(input_path, output_path, source, target, radius, debug, output_forma
     with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
         if output_format == 'json':
             json.dump(rebuild(xl, outcome, extras, target), f, indent=2, ensure_ascii=False)
-        elif in_json:
-            # Written as YAML from the data: the nodes commented out get the fixed names too.
-            fixed = with_fixed_names(xl, fixes)
-            f.write(patch_yaml(to_yaml(fixed), fixed, outcome, extras, target, notes))
         else:
-            f.write(patch_yaml(text, xl, outcome, extras, target, notes))
+            if in_json:
+                # Written as YAML from the data: the nodes commented out get the fixed names too.
+                fixed = with_fixed_names(xl, fixes)
+                patched = patch_yaml(to_yaml(fixed), fixed, outcome, extras, target, notes)
+            else:
+                patched = patch_yaml(text, xl, outcome, extras, target, notes)
+            f.write(with_header(patched, target.version))
     if debug:
         with open(output_path + '.report.tsv', 'w', encoding='utf-8', newline='') as f:
             w = csv.DictWriter(f, fieldnames=list(report[0].keys()) if report else ['status'], delimiter='\t')
@@ -1109,8 +1148,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('input', nargs='?', default=INPUT_DIR, help='.xl file or folder (default: input/)')
     ap.add_argument('output', nargs='?', default=OUTPUT_DIR, help='.xl file or folder (default: output/)')
-    ap.add_argument('--from', dest='source', required=True,
-                    help='game version the files were made for (e.g. 2.31), or a node export zip / folder')
+    ap.add_argument('--from', dest='source',
+                    help='game version the files were made for (e.g. 2.31), or a node export zip / folder; '
+                         'a file whose first lines give its version ("# Game version: 2.31") uses that one instead')
+    ap.add_argument('--force-from', action='store_true',
+                    help='use --from for every file, even those whose first lines give their game version')
     ap.add_argument('--to', dest='target', required=True, help='target game version (e.g. 2.5), or a node export')
     ap.add_argument('--versions-dir', default=VERSIONS_DIR, help='where node exports are kept and downloaded (default: versions/)')
     ap.add_argument('--release-url', default=RELEASE_URL, help='where missing node exports are downloaded from')
@@ -1122,28 +1164,51 @@ def main():
     ap.add_argument('--debug', action='store_true',
                     help='write a report next to each output file (<output>.report.tsv): how every node was matched')
     args = ap.parse_args()
+    if args.force_from and not args.source:
+        ap.error('--force-from needs --from')
     output_format = {'yml': 'yaml'}.get(args.format, args.format)
 
     todo = jobs(args.input, args.output, output_format == 'yaml')
     if not todo:
         raise SystemExit(f'no .xl file in {args.input}')
-    source = open_export(args.source, args.versions_dir, args.release_url)
+    # Source version of each file: its header, unless --force-from; else --from.
+    plan, missing = [], []
+    for input_path, output_path in todo:
+        version = None if args.force_from else header_version(input_path)
+        if version is not None and not VERSION_RX.match(version):
+            raise SystemExit(f'{input_path}: "{version}" in its "# Game version:" line is not a game version')
+        if version is None and args.source is None:
+            missing.append(input_path)
+        plan.append((input_path, output_path, version or args.source, version is not None))
+    if missing:
+        raise SystemExit('no game version for ' + ', '.join(missing) + ': give --from, or put a '
+                         '"# Game version: <version>" line at the top of the file')
+    sources = {spec: open_export(spec, args.versions_dir, args.release_url) for spec in dict.fromkeys(p[2] for p in plan)}
     target = open_export(args.target, args.versions_dir, args.release_url)
-    if source.version == target.version:
-        raise SystemExit(f'source and target are both game version {source.version}')
-    print(f'{source.version} -> {target.version}, {len(todo)} file(s)')
+    versions = [s.version for s in sources.values() if s.version != target.version] or [target.version]
+    print(f"{', '.join(versions)} -> {target.version}, {len(todo)} file(s)")
 
     totals = defaultdict(int)
-    for input_path, output_path in todo:
+    for input_path, output_path, spec, from_header in plan:
+        source = sources[spec]
+        if source.version == target.version:
+            print(f'\n{input_path}: already made for game version {target.version}'
+                  + (' (its "# Game version:" line)' if from_header else '') + ', skipped')
+            continue
         report = convert(input_path, output_path, source, target, args.radius, args.debug, output_format)
         if report is None:
             print(f'\n{input_path}: no streaming sectors, skipped')
             continue
+        origin = ''
+        if from_header:
+            origin = ', from its "# Game version:" line' + \
+                (f' instead of --from {args.source}' if args.source and spec != args.source else '')
         counts = defaultdict(int)
         for r in report:
             counts[r['status']] += 1
             totals[r['status']] += 1
-        print(f'\n{input_path}\n  {len(report)} nodes: ' + ', '.join(f'{counts[s]} {s}' for s in STATUSES if counts[s]))
+        print(f'\n{input_path} ({source.version} -> {target.version}{origin})\n  {len(report)} nodes: '
+              + ', '.join(f'{counts[s]} {s}' for s in STATUSES if counts[s]))
         for r in report:
             if r['status'] != 'exact' or r['note']:
                 print(f"    {r['status']:9} {r['sector']} #{r['old_index']} {r['old_type']} '{r['debugName']}' -> "
