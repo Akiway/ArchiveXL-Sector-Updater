@@ -120,6 +120,12 @@ indices, types and counts change.
 
 Hand-edited files with tabs at the end of lines are accepted (they are removed from the output).
 
+**Corrupted debugNames**: some tools write raw bytes (a memory address) as the debugName of nodes that have none in
+the game, mostly `worldInstancedMeshNode` and `worldEntityProxyMeshNode`, which can make the file invalid UTF-8.
+Such files are read anyway (with a warning), these names are not used to match nodes, and each is replaced by the
+debugName of the node at its index in the `--from` version, or by `''` when it has none (the usual case). The console
+gives their count, the report's `name_fix` column the old and new values.
+
 ### Options
 
 Convert a single file or another folder by giving the input and output:
@@ -147,7 +153,7 @@ skipped.
 The `--debug` report opens in Excel / LibreOffice and details every node: `status`, `sector`, `kind`, `old_index`,
 `old_type`, `debugName`, `new_sector` (empty if same sector), `new_index`, `new_type`, `distance_m`, `resources`
 (Jaccard index of the resources), `elements` (share of actors / instances found), `actors` (remapped
-actors / instances / total), `note`.
+actors / instances / total), `note`, `name_fix` (corrupted debugName replaced: old -> new value).
 
 ## FAQ
 

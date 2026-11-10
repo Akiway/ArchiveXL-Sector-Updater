@@ -16,7 +16,7 @@ found are commented out with what they were in the source version. --format json
 With --debug, a report (<output>.report.tsv) lists how each node was matched so that anything uncertain can be
 checked by hand.
 """
-import argparse, csv, functools, json, math, os, re, sys, urllib.error, urllib.request, zipfile
+import argparse, copy, csv, functools, json, math, os, re, sys, urllib.error, urllib.request, zipfile
 from collections import defaultdict
 
 import yaml
@@ -304,12 +304,46 @@ def candidates(old, sectors, radius):
     return found
 
 
+def corrupted_name(name):
+    """A debugName made of raw bytes: some tools write a pointer (e.g. 10 8b a0 81 cc 01) for the nodes that have no
+    name in the game (worldInstancedMeshNode, worldEntityProxyMeshNode). Their control characters and invalid UTF-8
+    (read as U+FFFD) give them away."""
+    return isinstance(name, str) and any(c == '�' or ord(c) < 32 or 0x7f <= ord(c) < 0xa0 for c in name)
+
+
 def file_debug_name(node):
     """debugName as written in the file, or None. An unquoted {name} reads as a YAML mapping."""
     name = node.get('debugName')
     if isinstance(name, dict):
         return '{' + ', '.join(map(str, name)) + '}'
-    return None if name in (None, '', 'None') else str(name)
+    return None if name in (None, '', 'None') or corrupted_name(name) else str(name)
+
+
+def name_fixes(xl, source):
+    """{(sector no, kind, node no): (corrupted debugName, replacement)}: the debugName of the node at its index in the
+    source version (same family), or '' when it has none, as the game gives no name to these nodes."""
+    fixes = {}
+    for si, sector in enumerate(xl['streaming']['sectors']):
+        records = source.sector(sector['path'])
+        for kind in ('nodeDeletions', 'nodeMutations'):
+            for n, node in enumerate(sector.get(kind) or []):
+                name = node.get('debugName')
+                if not corrupted_name(name):
+                    continue
+                idx, file_type = node.get('index'), node.get('type')
+                old = records[idx] if records is not None and isinstance(idx, int) and not isinstance(idx, bool) \
+                    and 0 <= idx < len(records) else None
+                fits = old is not None and (not file_type or file_type.replace('worldCooked', 'world', 1) == old.family)
+                fixes[si, kind, n] = name, (old.debug_name or '') if fits else ''
+    return fixes
+
+
+def with_fixed_names(xl, fixes):
+    """A copy of xl with the corrupted debugNames replaced."""
+    fixed = copy.deepcopy(xl)
+    for (si, kind, n), (_, name) in fixes.items():
+        fixed['streaming']['sectors'][si][kind][n]['debugName'] = name
+    return fixed
 
 
 def name_stem(name):
@@ -444,7 +478,13 @@ ELEMENT_KEYS = [('actorDeletions', 'expectedActors'), ('instanceDeletions', 'exp
 
 
 def load_xl(path):
-    text = open(path, encoding='utf-8-sig').read()
+    raw = open(path, 'rb').read()
+    try:
+        text = raw.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        # Raw bytes written as debugNames by some tools (see corrupted_name): read as U+FFFD, replaced later.
+        text = raw.decode('utf-8-sig', errors='replace')
+        print(f'warning: {path} is not valid UTF-8 (corrupted debugNames?)', file=sys.stderr)
     # Hand-edited files can carry trailing tabs, which ArchiveXL tolerates but PyYAML rejects.
     text = '\n'.join(line.rstrip() for line in text.splitlines()) + '\n'
     return yaml.safe_load(text), text.lstrip().startswith('{'), text
@@ -470,8 +510,9 @@ def to_yaml(data):
     return yaml.dump(data, Dumper=IndentDumper, sort_keys=False, allow_unicode=True, default_flow_style=False)
 
 
-def update(xl, source, target, radius, report, label=''):
-    """Match every node of the file. Returns (outcome, extras, notes).
+def update(xl, source, target, radius, report, label='', fixes=None):
+    """Match every node of the file. Returns (outcome, extras, notes). fixes: see name_fixes, written into the nodes
+    found.
     outcome: {(sector no, kind, node no): (new sector path, updated node, remaps)} for the nodes found, remaps giving
     for each entry of their actor / instance lists its new index, None when not found, or (sector path, node index)
     when the target version moved it to another node; (None, why, None) for the others.
@@ -773,6 +814,12 @@ def update(xl, source, target, radius, report, label=''):
         elif new_path is None:  # found by name in the source version, then not in the target one
             outcome[key] = None, f'{why}\n{updated}', None
 
+    for key, (bad, name) in (fixes or {}).items():
+        new_path, updated, _ = outcome[key]
+        if new_path is not None:
+            updated['debugName'] = name
+        rows[key]['name_fix'] = f"{bad!r} -> {name!r}" + (f' (from {source.version})' if name else '')
+
     kinds = ('nodeDeletions', 'nodeMutations')
     report.extend(rows[k] for k in sorted(rows, key=lambda k: (k[0], kinds.index(k[1]), k[2])))
     if show_progress:
@@ -807,7 +854,17 @@ def rebuild(xl, outcome, extras, target):
 
 
 def flow(value):
-    return '[' + ', '.join(map(str, value)) + ']' if isinstance(value, list) else str(value)
+    if isinstance(value, list):
+        return '[' + ', '.join(map(str, value)) + ']'
+    if isinstance(value, str):
+        # Quoted when YAML would not read it back as this string: '' (null), {name} (a mapping), a: b...
+        try:
+            plain = bool(value) and value == value.strip() and yaml.safe_load(value) == value
+        except yaml.YAMLError:
+            plain = False
+        if not plain:
+            return json.dumps(value, ensure_ascii=False)
+    return str(value)
 
 
 def patch_yaml(text, xl, outcome, extras, target, notes=None):
@@ -979,6 +1036,7 @@ def row(path, kind, node, old, status, new_path=None, new=None, details=None, ac
         'elements': '' if details is None or details['elements'] is None else f"{details['elements']:.2f}",
         'actors': actors,
         'note': note,
+        'name_fix': '',  # corrupted debugName replaced, see name_fixes
     }
 
 
@@ -1027,13 +1085,18 @@ def convert(input_path, output_path, source, target, radius, debug, output_forma
     if os.path.abspath(input_path) == os.path.abspath(output_path):
         raise SystemExit(f'{input_path}: the output would overwrite the input')
     report = []
-    outcome, extras, notes = update(xl, source, target, radius, report, os.path.basename(input_path))
+    fixes = name_fixes(xl, source)
+    outcome, extras, notes = update(xl, source, target, radius, report, os.path.basename(input_path), fixes)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
         if output_format == 'json':
             json.dump(rebuild(xl, outcome, extras, target), f, indent=2, ensure_ascii=False)
+        elif in_json:
+            # Written as YAML from the data: the nodes commented out get the fixed names too.
+            fixed = with_fixed_names(xl, fixes)
+            f.write(patch_yaml(to_yaml(fixed), fixed, outcome, extras, target, notes))
         else:
-            f.write(patch_yaml(to_yaml(xl) if in_json else text, xl, outcome, extras, target, notes))
+            f.write(patch_yaml(text, xl, outcome, extras, target, notes))
     if debug:
         with open(output_path + '.report.tsv', 'w', encoding='utf-8', newline='') as f:
             w = csv.DictWriter(f, fieldnames=list(report[0].keys()) if report else ['status'], delimiter='\t')
@@ -1085,6 +1148,9 @@ def main():
             if r['status'] != 'exact' or r['note']:
                 print(f"    {r['status']:9} {r['sector']} #{r['old_index']} {r['old_type']} '{r['debugName']}' -> "
                       f"{r['new_sector'] or 'same sector'} #{r['new_index']} {r['note']}")
+        if fixed := sum(bool(r['name_fix']) for r in report):
+            print(f'  {fixed} corrupted debugName(s) replaced by the {source.version} name, or emptied'
+                  + (' (see the report)' if args.debug else ''))
         print(f'  -> {output_path}')
     if len(todo) > 1:
         print(f'\ntotal {sum(totals.values())} nodes: ' + ', '.join(f'{totals[s]} {s}' for s in STATUSES if totals[s]))
