@@ -15,9 +15,9 @@ actor/instance positions) instead of by index, then written back with its new in
 remapped actor / instance lists. The output is YAML written into the input text, so its comments stay; nodes not
 found are commented out with what they were in the source version. --format json rewrites the file as JSON instead.
 With --debug, a report (<output>.report.tsv) lists how each node was matched so that anything uncertain can be
-checked by hand.
+checked by hand. The console output of the last 10 runs is kept in the logs/ folder.
 """
-import argparse, copy, csv, functools, json, math, os, re, sys, urllib.error, urllib.request, zipfile
+import argparse, copy, csv, datetime, functools, json, math, os, re, sys, textwrap, traceback, urllib.error, urllib.request, zipfile
 from collections import defaultdict
 
 import yaml
@@ -32,8 +32,8 @@ CELL_SIZES = {'exterior_': 64, 'interior_': 32}
 GRID_LEVELS = range(5)
 # Their actors / instances are stored relative to the node: they only locate a node that did not move.
 RELATIVE_ELEMENTS = {'worldInstancedDestructibleMeshNode', 'worldInstancedOccluderNode'}
-LEVELS = ['exact', 'match', 'moved']  # best first; then "by name", "already target", "not found", "source mismatch"
-STATUSES = LEVELS + ['by name', 'already target', 'not found', 'source mismatch']
+LEVELS = ['exact', 'match', 'moved']  # best first; then "by name", "already target", "other mod", "not found"...
+STATUSES = LEVELS + ['by name', 'already target', 'other mod', 'not found', 'source mismatch']
 # Numbering at the end of a name: _001 in the game, .001 in Blender; also an empty _ before a closing brace.
 NUMBERING_RX = re.compile(r'([._]\d*)+$')
 
@@ -41,6 +41,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 VERSIONS_DIR = os.path.join(SCRIPT_DIR, 'versions')  # node exports, downloaded here when missing
 INPUT_DIR = os.path.join(SCRIPT_DIR, 'input')        # default input
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'output')      # default output
+LOGS_DIR = os.path.join(SCRIPT_DIR, 'logs')          # console output of the last runs
+LOGS_KEPT = 10
+LOG_RX = re.compile(r'^\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d(_\d+)?\.log$')
 RELEASE_URL = 'https://github.com/Akiway/ArchiveXL-Sector-Updater/releases/download/node-exports/'
 NODES_SCHEMA = 1                                     # version of docs/NODE_RECORDS.md
 NODES_MANIFEST = 'manifest.json'
@@ -91,6 +94,7 @@ class NodeExport:
     def __init__(self, location):
         self.location = location
         self._cache = {}
+        self._counts = {}
         if os.path.isdir(location):
             self._zip = None
             manifest = os.path.join(location, NODES_MANIFEST)
@@ -110,6 +114,15 @@ class NodeExport:
             return self._zip.read(name).decode('utf-8').splitlines() if name else None
         f = os.path.join(self.location, *path.split('\\')) + '.jsonl'
         return open(f, encoding='utf-8').read().splitlines() if os.path.exists(f) else None
+
+    def count(self, path):
+        """Node count of a sector, None when missing; does not keep its records (see versions_matching)."""
+        if path in self._cache:
+            return None if self._cache[path] is None else len(self._cache[path])
+        if path not in self._counts:
+            lines = self._lines(path)
+            self._counts[path] = None if lines is None else sum(1 for l in lines if l)
+        return self._counts[path]
 
     def sector(self, path):
         if path not in self._cache:
@@ -195,6 +208,64 @@ def open_export(spec, versions_dir, release_url):
     if schema != NODES_SCHEMA:
         raise ExportError(f'{export.location} uses record schema {schema}, this script reads schema {NODES_SCHEMA}')
     return export
+
+
+def version_key(version):
+    """Game versions in release order: their parts after the first are decimals (2.13 < 2.2 < 2.21)."""
+    if not VERSION_RX.match(version):
+        return (math.inf,)
+    major, *rest = version.split('.')
+    return (int(major), *(float('0.' + p) for p in rest))
+
+
+class LocalExports:
+    """The node exports already in the versions folder (none downloaded), opened when first needed: they tell which
+    game version a file was made for (see expected_nodes_warning)."""
+
+    def __init__(self, versions_dir, opened=()):
+        self.versions_dir = versions_dir
+        self._exports = {e.version: e for e in opened}
+        self._listed = False
+
+    def all(self):
+        if not self._listed:
+            self._listed = True
+            names = os.listdir(self.versions_dir) if self.versions_dir and os.path.isdir(self.versions_dir) else []
+            for name in names:
+                m = re.fullmatch(r'nodes-(?P<version>.+)\.zip', name)
+                if m and VERSION_RX.match(m['version']) and m['version'] not in self._exports:
+                    try:
+                        export = NodeExport(os.path.join(self.versions_dir, name))
+                    except (OSError, zipfile.BadZipFile, ValueError):
+                        continue
+                    if export.version == m['version'] and export.manifest.get('schema', NODES_SCHEMA) == NODES_SCHEMA:
+                        self._exports[export.version] = export
+        return [self._exports[v] for v in sorted(self._exports, key=version_key)]
+
+
+def expected_nodes_warning(expected, source, exports):
+    """Warning when the expectedNodes of the file ({sector path: count}) differ from the node counts of the source
+    version, with the versions they match among the local exports: (message, verdict), or None when they all fit.
+    verdict: {'matched': versions that fit every sector, 'whole': whether every sector differs from the source}."""
+    wrong = [p for p, n in expected.items() if source.count(p) != n]
+    if not wrong:
+        return None
+    text = f'expectedNodes differs from {source.version} in {len(wrong)} / {len(expected)} sector(s)'
+    if len(wrong) < len(expected):  # only some sectors: name them, they may have been edited by hand
+        names = [p.rsplit('\\', 1)[-1] for p in wrong]
+        text += f' ({", ".join(names[:5])}{", ..." if len(names) > 5 else ""})'
+    hits = {e.version: sum(e.count(p) == n for p, n in expected.items()) for e in exports.all()}
+    full = [v for v, h in hits.items() if h == len(expected)]
+    verdict = {'matched': full, 'whole': len(wrong) == len(expected)}
+    if full:
+        return (text + f': the file was made for {" / ".join(full)}'
+                + (' (same counts)' if len(full) > 1 else '')
+                + f'. Convert it from {"one of them" if len(full) > 1 else "it"}: --from, or a "# Game version:" line',
+                verdict)
+    best = max(hits.values(), default=0)
+    closest = [v for v, h in hits.items() if h == best]
+    return (text + ': it matches no exported version'
+            + (f' (closest: {" / ".join(closest)}, {best} / {len(expected)} sector(s))' if best else ''), verdict)
 
 
 def neighbours(path):
@@ -489,14 +560,15 @@ ELEMENT_KEYS = [('actorDeletions', 'expectedActors'), ('instanceDeletions', 'exp
                 ('actorMutations', 'expectedActors'), ('instanceMutations', 'expectedInstances')]
 
 
-def read_text(path, warn=True):
+def read_text(path, warnings=None):
+    """warnings: a list that receives (tag, message) when the file is not valid UTF-8."""
     raw = open(path, 'rb').read()
     try:
         return raw.decode('utf-8-sig')
     except UnicodeDecodeError:
         # Raw bytes written as debugNames by some tools (see corrupted_name): read as U+FFFD, replaced later.
-        if warn:
-            print(f'warning: {path} is not valid UTF-8 (corrupted debugNames?)', file=sys.stderr)
+        if warnings is not None:
+            warnings.append(('not UTF-8', 'not valid UTF-8 (corrupted debugNames?)'))
         return raw.decode('utf-8-sig', errors='replace')
 
 
@@ -518,7 +590,7 @@ def find_header(text):
 
 def header_version(path):
     """Game version that the file's header gives (see find_header), or None."""
-    header = find_header(read_text(path, warn=False))
+    header = find_header(read_text(path))
     return header[2] if header else None
 
 
@@ -531,8 +603,8 @@ def with_header(text, version):
     return line + text
 
 
-def load_xl(path):
-    text = read_text(path)
+def load_xl(path, warnings=None):
+    text = read_text(path, warnings)
     # Hand-edited files can carry trailing tabs, which ArchiveXL tolerates but PyYAML rejects.
     text = '\n'.join(line.rstrip() for line in text.splitlines()) + '\n'
     # JSON, maybe under comments (a "# Game version:" line added by hand): rewritten as YAML from the data.
@@ -561,16 +633,19 @@ def to_yaml(data):
 
 
 def update(xl, source, target, radius, report, label='', fixes=None):
-    """Match every node of the file. Returns (outcome, extras, notes). fixes: see name_fixes, written into the nodes
-    found.
+    """Match every node of the file. Returns (outcome, extras, notes, expected). fixes: see name_fixes, written into
+    the nodes found.
     outcome: {(sector no, kind, node no): (new sector path, updated node, remaps)} for the nodes found, remaps giving
     for each entry of their actor / instance lists its new index, None when not found, or (sector path, node index)
     when the target version moved it to another node; (None, why, None) for the others.
     extras: [(sector path, kind, node)], the entries added for the actors / instances moved to another node.
-    notes: {key: comment} for the nodes found by their debugName instead of their index ("by name")."""
+    notes: {key: comment} for the nodes found by their debugName instead of their index ("by name").
+    expected: {sector path: expectedNodes} of the sectors that give it and are in the source version (see
+    expected_nodes_warning)."""
     outcome = {}
     rows = {}     # same keys as outcome: report rows, written in the order of the file
     extras = []
+    expected = {}
     in_sectors = xl['streaming']['sectors']
     show_progress = sys.stderr.isatty()  # no progress lines in redirected output
     not_found = f'not found in {target.version}'
@@ -671,14 +746,24 @@ def update(xl, source, target, radius, report, label='', fixes=None):
         path = sector['path']
         old_records = source.sector(path)
         if old_records is None:
+            unreadable = path in source.manifest.get('unreadable_sectors', [])
+            if not unreadable and target.sector(path) is None:
+                # In no game version: a sector that another mod adds. Its indices only depend on that mod: kept.
+                for kind in ('nodeDeletions', 'nodeMutations'):
+                    for n, node in enumerate(sector.get(kind) or []):
+                        outcome[done, kind, n] = path, dict(node), {}
+                        rows[done, kind, n] = row(path, kind, node, None, 'other mod', path,
+                                                  note='sector in no game version (another mod adds it): kept as it is')
+                continue
+            missing = 'sector unreadable in the source export' if unreadable else 'sector missing from the source export'
             for kind in ('nodeDeletions', 'nodeMutations'):
                 for n, node in enumerate(sector.get(kind) or []):
                     fail((done, kind, n), path, node, None, f'sector missing from the {source.version} export',
-                         note='sector missing from the source export')
+                         note=missing)
             continue
-        if sector.get('expectedNodes') not in (None, len(old_records)):
-            print(f'\rwarning: {path} has {len(old_records)} nodes in the source version, the file expects '
-                  f'{sector["expectedNodes"]}: it was not made for this source version', file=sys.stderr)
+        count = sector.get('expectedNodes')
+        if isinstance(count, int) and not isinstance(count, bool):
+            expected.setdefault(path, count)
 
         for kind in ('nodeDeletions', 'nodeMutations'):
             for n, node in enumerate(sector.get(kind) or []):
@@ -874,23 +959,32 @@ def update(xl, source, target, radius, report, label='', fixes=None):
     report.extend(rows[k] for k in sorted(rows, key=lambda k: (k[0], kinds.index(k[1]), k[2])))
     if show_progress:
         print(f'\r{label}: {len(in_sectors)} / {len(in_sectors)} sectors (100%)', file=sys.stderr)
-    return outcome, extras, notes
+    return outcome, extras, notes, expected
 
 
 def rebuild(xl, outcome, extras, target):
     """The converted file as data: one entry per sector, sorted by path, nodes sorted by index."""
     out_sectors = {}
+    # Another mod's sector (other mod) keeps the count of the file.
+    counts = {}
+    for s in xl['streaming']['sectors']:
+        if s.get('expectedNodes') is not None:
+            counts.setdefault(s['path'], s['expectedNodes'])
     nodes = [(new_path, kind, updated) for (_, kind, _), (new_path, updated, _) in outcome.items()] + extras
     for new_path, kind, updated in nodes:
         if new_path is None:
             continue
         if new_path not in out_sectors:
+            records = target.sector(new_path)
             out_sectors[new_path] = {'nodeDeletions': [], 'nodeMutations': [],
-                                     'expectedNodes': len(target.sector(new_path)), 'path': new_path}
+                                     'expectedNodes': len(records) if records is not None else counts.get(new_path),
+                                     'path': new_path}
         out_sectors[new_path][kind].append(updated)
 
     sectors = []
     for s in out_sectors.values():
+        if s['expectedNodes'] is None:
+            del s['expectedNodes']
         s['nodeDeletions'].sort(key=lambda n: n['index'])
         s['nodeMutations'].sort(key=lambda n: n['index'])
         for kind in ('nodeDeletions', 'nodeMutations'):
@@ -999,7 +1093,7 @@ def patch_yaml(text, xl, outcome, extras, target, notes=None):
 
     for si, (sector, entry) in enumerate(zip(in_sectors, entries.value)):
         path = sector['path']
-        if si in kept:
+        if si in kept and target.sector(path) is not None:  # another mod's sector (other mod) keeps its count
             expected = len(target.sector(path))
             if sector.get('expectedNodes') != expected:
                 set_value(entry, 'expectedNodes', expected, 'path')
@@ -1125,18 +1219,25 @@ def jobs(input_path, output_path, yaml_out):
     return [(input_path, output_path)]
 
 
-def convert(input_path, output_path, source, target, radius, debug, output_format='yaml'):
-    """Convert one file. Returns the report rows, or None when the file has no streaming sectors.
+def convert(input_path, output_path, source, target, radius, debug, output_format='yaml', exports=None):
+    """Convert one file. Returns (report rows, warnings, verdict), or None when the file has no streaming sectors.
+    warnings: [(tag, message)], printed under the file and tagged in the summary. verdict: see expected_nodes_warning,
+    None when its expectedNodes fit the source version.
     output_format 'yaml' edits the input text, which keeps its comments and order (a JSON input is first written as
-    YAML); 'json' rewrites the file."""
-    xl, in_json, text = load_xl(input_path)
+    YAML); 'json' rewrites the file. exports: the LocalExports that tell which version the file was made for."""
+    warnings = []
+    xl, in_json, text = load_xl(input_path, warnings)
     if not isinstance(xl, dict) or not isinstance(xl.get('streaming'), dict) or not xl['streaming'].get('sectors'):
         return None
     if os.path.abspath(input_path) == os.path.abspath(output_path):
         raise SystemExit(f'{input_path}: the output would overwrite the input')
     report = []
     fixes = name_fixes(xl, source)
-    outcome, extras, notes = update(xl, source, target, radius, report, os.path.basename(input_path), fixes)
+    outcome, extras, notes, expected = update(xl, source, target, radius, report, os.path.basename(input_path), fixes)
+    verdict = None
+    if found := expected_nodes_warning(expected, source, exports or LocalExports(None, [source, target])):
+        message, verdict = found
+        warnings.append(('expectedNodes', message))
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
         if output_format == 'json':
@@ -1154,7 +1255,161 @@ def convert(input_path, output_path, source, target, radius, debug, output_forma
             w = csv.DictWriter(f, fieldnames=list(report[0].keys()) if report else ['status'], delimiter='\t')
             w.writeheader()
             w.writerows(report)
-    return report
+    return report, warnings, verdict
+
+
+class Log:
+    """Console output (stdout) of a run, also written to a file of the logs folder; only the last LOGS_KEPT runs are
+    kept there. The progress lines and downloads (stderr) stay out of it."""
+
+    def __init__(self):
+        self.file = None
+        self.path = None
+
+    def open(self, logs_dir, kept=LOGS_KEPT):
+        try:
+            os.makedirs(logs_dir, exist_ok=True)
+            old = sorted(n for n in os.listdir(logs_dir) if LOG_RX.match(n))
+            for name in old[:max(0, len(old) - (kept - 1))]:
+                os.remove(os.path.join(logs_dir, name))
+            stamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            path, n = os.path.join(logs_dir, f'{stamp}.log'), 1
+            while os.path.exists(path):  # two runs in the same second
+                n += 1
+                path = os.path.join(logs_dir, f'{stamp}_{n}.log')
+            self.file = open(path, 'w', encoding='utf-8', newline='\n')
+            self.path = path
+        except OSError as e:  # the conversion does not need the log
+            print(f'warning: no log written in {logs_dir} ({e})', file=sys.stderr)
+            return
+        self.write(f'# {datetime.datetime.now():%Y-%m-%d %H:%M:%S}  ' + ' '.join(sys.argv))
+
+    def write(self, text=''):
+        """To the log only."""
+        if self.file:
+            self.file.write(text + '\n')
+            self.file.flush()
+
+    def __call__(self, text=''):
+        """To the console and the log."""
+        print(text)
+        self.write(text)
+
+    def close(self):
+        if self.file:
+            self.file.close()
+            self.file = None
+
+
+log = Log()
+
+
+def summary(rows, statuses):
+    """Table of the files, those to look at first: not converted, nodes lost, warnings, nodes to check in game.
+    A file that is not valid UTF-8 needs nothing (its names are replaced): tagged, not moved up."""
+    def attention(r):
+        counts = r['counts']
+        return (r['missing_export'], counts['not found'] + counts['source mismatch'],
+                sum(tag != 'not UTF-8' for tag, _ in r['warnings']), sum(counts.values()) - counts['exact'])
+
+    rows = sorted(rows, key=lambda r: (tuple(-x for x in attention(r)), r['file'].lower()))
+    head = ['file', 'from', 'nodes'] + statuses + ['warnings']
+    table = []
+    for r in rows:
+        counts = r['counts']
+        if r['skipped']:
+            numbers = [''] * (1 + len(statuses))
+            notes = r['skipped']
+        else:
+            numbers = [str(sum(counts.values()))] + [str(counts[s] or '-') for s in statuses]
+            notes = ', '.join(tag for tag, _ in r['warnings'])
+        table.append([r['file'], r['source']] + numbers + [notes])
+    totals = defaultdict(int)
+    for r in rows:
+        for s, n in r['counts'].items():
+            totals[s] += n
+    table.append(['total', '', str(sum(totals.values()))] + [str(totals[s] or '-') for s in statuses] + [''])
+    widths = [max(len(line[i]) for line in [head] + table) for i in range(len(head))]
+
+    def fmt(line):
+        cells = [c.ljust(w) if i < 2 or i == len(line) - 1 else c.rjust(w) for i, (c, w) in enumerate(zip(line, widths))]
+        return '  '.join(cells).rstrip()
+
+    lines = [fmt(head), '  '.join('-' * w for w in widths)] + [fmt(line) for line in table[:-1]]
+    return lines + ['  '.join('-' * w for w in widths), fmt(table[-1])]
+
+
+def advice(rows, target, exported, radius, width=116):
+    """What to try for the nodes left out (source mismatch, not found), grouped by cause, with the files concerned.
+    rows: see run; exported: the versions with a node export."""
+    groups = []
+
+    def group(title, files, text):
+        if files:
+            lines = [f'{title}:']
+            for f in files:
+                lines += textwrap.wrap(f, width, initial_indent='  ', subsequent_indent='    ')
+            groups.append(lines + textwrap.wrap(text, width, initial_indent='  ', subsequent_indent='  '))
+
+    def nodes(n):
+        return f'{n} node{"s" if n > 1 else ""}'
+
+    def files(key):
+        return [f'{r["file"]}: {nodes(r[key])}' for r in rows if r[key]]
+
+    # source mismatch: in a file whose expectedNodes all differ from its source version, or fit another one, the
+    # file was made for another version; elsewhere, the file has a wrong index or debugName
+    other_version, unexported, misnumbered = [], [], []
+    for r in rows:
+        n = r['counts']['source mismatch']
+        if not n:
+            continue
+        verdict = r['verdict']
+        if verdict and verdict['matched']:
+            matched = verdict['matched']
+            if len(matched) == 1:
+                how = (f'set its "# Game version:" line to {matched[0]}' if r['from_header'] else
+                       f'add a "# Game version: {matched[0]}" line at the top of the input file')
+            else:
+                how = f'convert it from one of them (same node counts), the most recent first'
+            other_version.append(f'{r["file"]}: {nodes(n)}, made for {" / ".join(matched)}, not {r["source"]}: '
+                                 f'{how}, and run again.')
+        elif verdict and verdict['whole']:
+            unexported.append(f'{r["file"]}: {nodes(n)}')
+        else:
+            misnumbered.append(f'{r["file"]}: {nodes(n)}')
+    group('source mismatch, file made for another game version', other_version,
+          'Its indices are those of that version: only the nodes found by their debugName (by name) were converted.')
+    group('source mismatch, file made for a game version without node export', unexported,
+          'Its expectedNodes match no version that has a node export, so its indices cannot be converted: only the '
+          'nodes found by their debugName (by name) were. Get a version of the file made for one of '
+          f'{", ".join(exported)} (from its author, or an older download of the mod) and convert that one, or redo '
+          f'these nodes by hand in {target}.')
+    group('source mismatch, wrong index or debugName in the file', misnumbered,
+          'The node at the index of the file is not what the file says (another type or debugName). Its comment in the '
+          'output gives that node and the nodes its debugName could be: find the right one (WolvenKit, or in game), '
+          'fix its index in the input file, and run again.')
+
+    group('not found, sector missing from the source version', files('missing_sector'),
+          f'The sector exists in {target} but not in the version the file was converted from: the file was made for '
+          'another game version. Check --from, or its "# Game version:" line, and run again.')
+    group('not found, sector unreadable in the node export', files('unreadable'),
+          'The game sector could not be read when the node export was built: convert these nodes by hand.')
+    group('not found, invalid index', files('invalid_index'),
+          'The index is not a number of 0 or more: fix it in the input file, and run again.')
+    gone = [f'{r["file"]}: {nodes(n)}' for r in rows if (n := r['counts']['not found'] - r['missing_sector']
+                                                          - r['unreadable'] - r['invalid_index'])]
+    group('not found', gone,
+          f'The object no longer exists in {target}, or changed too much. Its comment in the output gives what it was '
+          'before (type, name or resource, position): look at that place in game. If the object is still there, add '
+          f'its removal to the output by hand; if it only moved by more than {radius:g} m, run again with a larger '
+          f'--radius (e.g. --radius {max(5, radius * 2):g}).')
+    if not groups:
+        return []
+    lines = ['What to do', '----------']
+    for g in groups:
+        lines += g + ['']
+    return lines[:-1]
 
 
 def main():
@@ -1179,8 +1434,30 @@ def main():
     args = ap.parse_args()
     if args.force_from and not args.source:
         ap.error('--force-from needs --from')
-    output_format = {'yml': 'yaml'}.get(args.format, args.format)
 
+    log.open(LOGS_DIR)
+    try:
+        run(args)
+    except SystemExit as e:
+        if isinstance(e.code, str):  # an error message: printed here, before the log line
+            print(e.code, file=sys.stderr)
+            log.write(e.code)
+            raise SystemExit(1) from None
+        raise
+    except KeyboardInterrupt:
+        log.write('interrupted')
+        raise
+    except Exception:
+        log.write(traceback.format_exc())
+        raise
+    finally:
+        if log.path:
+            print(f'\nlog: {log.path}')
+        log.close()
+
+
+def run(args):
+    output_format = {'yml': 'yaml'}.get(args.format, args.format)
     todo = jobs(args.input, args.output, output_format == 'yaml')
     if not todo:
         raise SystemExit(f'no .xl file in {args.input}')
@@ -1210,52 +1487,77 @@ def main():
             if spec == args.source:
                 raise SystemExit(f'--from {spec}: {e}')
             unavailable[spec] = e
-            print(f'warning: {e}', file=sys.stderr)
+            log(f'warning: {e}')
     versions = [s.version for s in sources.values() if s.version != target.version] or [target.version]
-    print(f"{', '.join(versions)} -> {target.version}, {len(todo)} file(s)")
+    log(f"{', '.join(versions)} -> {target.version}, {len(todo)} file(s)")
+    exports = LocalExports(args.versions_dir, [target, *sources.values()])
 
-    totals = defaultdict(int)
+    def name(path):  # in the summary: relative to the input folder
+        return os.path.relpath(path, args.input) if os.path.isdir(args.input) else os.path.basename(path)
+
+    rows = []  # summary, one per file
     skipped = []  # files whose game version has no node export
     for input_path, output_path, spec, from_header in plan:
+        r = {'file': name(input_path), 'source': spec, 'counts': defaultdict(int), 'warnings': [], 'skipped': '',
+             'missing_export': False, 'verdict': None, 'from_header': from_header, 'missing_sector': 0,
+             'unreadable': 0, 'invalid_index': 0}
+        rows.append(r)
         if spec in unavailable:
-            print(f'\n{input_path}: its "# Game version: {spec}" line names a version without node export, skipped')
+            log(f'\n{input_path}: its "# Game version: {spec}" line names a version without node export, skipped')
+            r['skipped'], r['missing_export'] = f'skipped: no node export for {spec}', True
             skipped.append(input_path)
             continue
         source = sources[spec]
+        r['source'] = source.version
         if source.version == target.version:
-            print(f'\n{input_path}: already made for game version {target.version}'
-                  + (' (its "# Game version:" line)' if from_header else '') + ', skipped')
+            log(f'\n{input_path}: already made for game version {target.version}'
+                + (' (its "# Game version:" line)' if from_header else '') + ', skipped')
+            r['skipped'] = f'skipped: already {target.version}'
             continue
-        report = convert(input_path, output_path, source, target, args.radius, args.debug, output_format)
-        if report is None:
-            print(f'\n{input_path}: no streaming sectors, skipped')
+        result = convert(input_path, output_path, source, target, args.radius, args.debug, output_format, exports)
+        if result is None:
+            log(f'\n{input_path}: no streaming sectors, skipped')
+            r['skipped'] = 'skipped: no streaming sectors'
             continue
+        report, r['warnings'], r['verdict'] = result
+        lost = [row_['note'] for row_ in report if row_['status'] == 'not found']
+        r['missing_sector'] = sum(note.startswith('sector missing from the source') for note in lost)
+        r['unreadable'] = sum(note.startswith('sector unreadable') for note in lost)
+        r['invalid_index'] = sum(note.startswith('invalid index') for note in lost)
         origin = ''
         if from_header:
             origin = ', from its "# Game version:" line' + \
                 (f' instead of --from {args.source}' if args.source and spec != args.source else '')
-        counts = defaultdict(int)
-        for r in report:
-            counts[r['status']] += 1
-            totals[r['status']] += 1
-        print(f'\n{input_path} ({source.version} -> {target.version}{origin})\n  {len(report)} nodes: '
-              + ', '.join(f'{counts[s]} {s}' for s in STATUSES if counts[s]))
-        for r in report:
-            if r['status'] != 'exact' or r['note']:
-                print(f"    {r['status']:9} {r['sector']} #{r['old_index']} {r['old_type']} '{r['debugName']}' -> "
-                      f"{r['new_sector'] or 'same sector'} #{r['new_index']} {r['note']}")
-        if fixed := sum(bool(r['name_fix']) for r in report):
-            print(f'  {fixed} corrupted debugName(s) replaced by the {source.version} name, or emptied'
-                  + (' (see the report)' if args.debug else ''))
-        print(f'  -> {output_path}')
+        counts = r['counts']
+        for row_ in report:
+            counts[row_['status']] += 1
+        log(f'\n{input_path} ({source.version} -> {target.version}{origin})')
+        for _, message in r['warnings']:
+            log(f'  warning: {message}')
+        log(f'  {len(report)} nodes: ' + ', '.join(f'{counts[s]} {s}' for s in STATUSES if counts[s]))
+        for row_ in report:
+            if row_['status'] not in ('exact', 'other mod') or row_['status'] == 'exact' and row_['note']:
+                log(f"    {row_['status']:9} {row_['sector']} #{row_['old_index']} {row_['old_type']} "
+                    f"'{row_['debugName']}' -> {row_['new_sector'] or 'same sector'} #{row_['new_index']} {row_['note']}")
+        if fixed := sum(bool(row_['name_fix']) for row_ in report):
+            log(f'  {fixed} corrupted debugName(s) replaced by the {source.version} name, or emptied'
+                + (' (see the report)' if args.debug else ''))
+        log(f'  -> {output_path}')
     if len(todo) > 1:
-        print(f'\ntotal {sum(totals.values())} nodes: ' + ', '.join(f'{totals[s]} {s}' for s in STATUSES if totals[s]))
+        statuses = [s for s in STATUSES if any(r['counts'][s] for r in rows)]
+        log()
+        for line in summary(rows, statuses):
+            log(line)
+    if lines := advice(rows, target.version, [e.version for e in exports.all()], args.radius):
+        log()
+        for line in lines:
+            log(line)
     if skipped:
         versions = ', '.join(unavailable)
-        print(f'\n{len(skipped)} file(s) not converted, no node export for game version {versions} '
-              '(see the warning above; --force-from converts them from --from):')
+        log(f'\n{len(skipped)} file(s) not converted, no node export for game version {versions} '
+            '(see the warning above; --force-from converts them from --from):')
         for path in skipped:
-            print(f'  {path}')
+            log(f'  {path}')
         sys.exit(1)
 
 

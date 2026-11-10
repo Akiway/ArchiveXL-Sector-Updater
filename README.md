@@ -49,7 +49,43 @@ Available versions: `1.63`, `2.02`, `2.13`, `2.2`, `2.21`, `2.31`, `2.5`.
 ### Reading the result
 
 While a file is converted, the console shows its progress (`INCF.xl: 523 / 1953 sectors (26%)`). Then it prints
-how many nodes got each status and lists every node that is not `exact`.
+the file's warnings, how many nodes got each status, and every node that is not `exact` (nor `other mod`):
+
+```
+input\ef_bugbears_apt.xl (2.31 -> 2.5)
+  warning: expectedNodes differs from 2.31 in 4 / 4 sector(s): it matches no exported version
+  35 nodes: 6 exact, 10 by name, 19 source mismatch
+    ...
+```
+
+The warnings are:
+
+- `expectedNodes differs from <version>`: the node counts the file gives (`expectedNodes`) are not those of the
+  `--from` version, so the file was probably made for another one. The tool compares them with every node export
+  in the `versions` folder and names the version they match (`the file was made for 2.13`), or the closest ones.
+  When only some sectors differ, they are listed: they may have been changed by another mod or by hand. See
+  [the FAQ](#results).
+- `not valid UTF-8`: the file has corrupted debugNames, replaced in the output (see
+  [The output file](#the-output-file)). Nothing to do.
+
+With several files, a table at the end gives one line per file, those to look at first on top: files not
+converted, then nodes lost (`not found`, `source mismatch`), warnings, and nodes to check in game.
+
+```
+file                          from  nodes  exact  match  by name  not found  source mismatch  warnings
+----------------------------  ----  -----  -----  -----  -------  ---------  ---------------  -------------
+file_1.xl                     2.31     35      6      -       10          -               19  expectedNodes
+file_2.xl                     2.31    129    116      -        6          3                4  not UTF-8
+file_3.xl                     2.31      7      7      -        -          -                -
+...
+```
+
+Last, a `What to do` section groups the nodes left out (`source mismatch`, `not found`) by cause, with the files
+concerned and what to try: convert the file from another version, fix an index by hand, look for an object in
+game…
+
+Everything the console prints (except the progress) is also written to the `logs` folder, one file per run
+(`2026-11-10_01-58-51.log`); the last 10 runs are kept.
 
 | Status | Meaning | In the output |
 |---|---|---|
@@ -59,6 +95,7 @@ how many nodes got each status and lists every node that is not `exact`.
 | `not found` | no such object in the new version, neither in the sector, nor in its 26 neighbours, nor in the sectors of the other grid levels around it, or none of the actors / instances it lists | commented out |
 | `by name` | the node at its index does not match the `--from` version, but its debugName names one other node of the sector: that node was converted (see below) | yes, **check it in game** |
 | `already target` | the node does not match the `--from` version but matches the `--to` one at the same index: the file mixes both versions (see below) | yes, index kept, type updated |
+| `other mod` | its sector is in no game version: another mod adds it, and the file edits that mod's nodes (see below) | yes, kept as it is |
 | `source mismatch` | the node matches neither the `--from` version nor the `--to` one at its index, and its debugName names no single other node: the file was made for another game version | commented out |
 
 A node matches a version when the node at its index has the same type, the same actor / instance count
@@ -110,6 +147,11 @@ streaming:
 - **Files that mix versions**: a file edited in both versions (a 2.31 removal list completed in 2.5) has nodes that
   already point to the right `--to` node. They are kept at their index (`already target`), with the `--to` type
   (`worldCookedStaticDecalNode`…), and the others are converted.
+- **Sectors of another mod**: a file can edit the nodes of a sector that another mod adds
+  (`ef_coronado_house_additions\sectors\ef_coronado_house_additions.streamingsector`), which no game version has.
+  Their indices only depend on that mod, not on the game version: these entries are kept as they are, with their
+  `expectedNodes` (`other mod`), but nothing checks them. If that mod has changed since the file was made, take the
+  new indices from its updated sector.
 - **Nodes found in another sector** are commented out with `moved to <sector>` and added to that sector: to its
   entry in the file, or to a new entry at the end of the list. 2.5 moved some nodes to a sector of another grid
   level (`exterior_2_2_0_1` → `exterior_4_4_1_0`): they are found there too.
@@ -236,16 +278,22 @@ The object no longer exists in the new version, or changed too much. It is comme
 its type, name and position in the old version (see [The output file](#the-output-file)): find its replacement in
 WolvenKit or in game and add it by hand if you still need it.
 
-**Some nodes are `source mismatch`, or the warning `it was not made for this source version`**
+**Some nodes are `source mismatch`, or the warning `expectedNodes differs from <version>`**
 The file was made for another game version than `--from` (for example a 2.3 file converted with `--from 2.31`).
-Run again with the right version. If that version is not on the `node-exports` release, these nodes cannot be
-converted automatically. A few isolated `source mismatch` nodes in a file that otherwise converts usually have a
+When the warning names the version the file was made for, run again with it (`--from`, or a
+`# Game version: <version>` line at the top of the file). When it matches no exported version, that version is
+not on the `node-exports` release (or not in your `versions` folder): these nodes cannot be converted
+automatically. A few isolated `source mismatch` nodes in a file that otherwise converts usually have a
 wrong index or name in the file: when their debugName names one node of the sector, they are converted as `by name`;
 otherwise the comment lists the nodes the name could designate: check them by hand.
 
 **Some nodes are `already target`**
 The file was partly made for the `--to` version already: these nodes are kept at their index. Check them in game if
 the file was not meant to mix versions.
+
+**Some nodes are `other mod`**
+They edit a sector that another mod adds, not the game: they are kept as they are (see
+[The output file](#the-output-file)). They stay valid as long as that mod has not changed its sector.
 
 **A converted collision removal does nothing in game**
 Removing actors from 2.5 collision nodes needs an ArchiveXL newer than 1.28.1: see

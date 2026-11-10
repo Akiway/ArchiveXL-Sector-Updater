@@ -228,3 +228,6 @@ input/*
 !input/.gitkeep
 output/*
 !output/.gitkeep
+# Console output of the last runs
+logs/*
+!logs/.gitkeep
